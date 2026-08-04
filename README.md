@@ -127,6 +127,23 @@ The complete documentation, RFCs and design documents are available in the docum
 
 ---
 
+## Publishing a release
+
+Add a crates.io API token to the repository's GitHub Actions secrets under the
+name `CRATES_IO_TOKEN`. GitHub Actions publishes the crate to crates.io and
+prebuilt Linux, macOS and Windows binaries when a semantic-version tag is
+pushed. The tag must match the version in `Cargo.toml`.
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+The workflow publishes the crate first, then creates the corresponding GitHub
+Release and generates its release notes automatically.
+
+---
+
 ## License
 
 Licensed under the Apache License 2.0.

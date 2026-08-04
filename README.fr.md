@@ -127,6 +127,24 @@ La documentation complète, les RFCs et les documents d'architecture sont dispon
 
 ---
 
+## Publier une version
+
+Ajoutez un jeton d'API crates.io aux secrets GitHub Actions du dépôt sous le nom
+`CRATES_IO_TOKEN`. GitHub Actions publie la crate sur crates.io ainsi que des
+binaires précompilés pour Linux, macOS et Windows lorsqu'un tag de version
+sémantique est poussé. Le tag doit correspondre à la version définie dans
+`Cargo.toml`.
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+Le workflow publie d'abord la crate, puis crée la GitHub Release correspondante
+et génère automatiquement ses notes de version.
+
+---
+
 ## Licence
 
 Distribué sous licence Apache 2.0.

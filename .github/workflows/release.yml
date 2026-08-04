@@ -63,6 +63,7 @@ jobs:
 
   publish-crate:
     name: Publish crate to crates.io
+    environment: build
     needs: build
     runs-on: ubuntu-latest
 

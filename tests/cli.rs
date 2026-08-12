@@ -3,7 +3,7 @@ use std::process::{Command, Stdio};
 
 #[test]
 fn announces_the_grpc_endpoint_on_stdout() {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_threadweave"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_threadweave-api"))
         .stdout(Stdio::piped())
         .spawn()
         .expect("failed to run the threadweave binary");

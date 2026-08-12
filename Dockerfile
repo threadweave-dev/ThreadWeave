@@ -13,16 +13,20 @@ COPY ThreadWeave-protocols/proto /build/ThreadWeave-protocols/proto
 RUN --mount=type=cache,id=threadweave-cargo-registry,target=/usr/local/cargo/registry \
     --mount=type=cache,id=threadweave-cargo-git,target=/usr/local/cargo/git \
     --mount=type=cache,id=threadweave-target,target=/build/ThreadWeave/target \
-    cargo build --locked --release && \
-    cp target/release/threadweave /threadweave && \
-    strip /threadweave
+    cargo build --locked --release --bins && \
+    cp target/release/threadweave-api /threadweave-api && \
+    cp target/release/threadweave-scheduler /threadweave-scheduler && \
+    cp target/release/threadweave-worker /threadweave-worker && \
+    strip /threadweave-api /threadweave-scheduler /threadweave-worker
 
 FROM scratch AS runtime
 
-COPY --from=builder /threadweave /threadweave
+COPY --from=builder /threadweave-api /threadweave-api
+COPY --from=builder /threadweave-scheduler /threadweave-scheduler
+COPY --from=builder /threadweave-worker /threadweave-worker
 COPY ThreadWeave/docker/threadweave.yaml /etc/threadweave/threadweave.yaml
 
 USER 65532:65532
 EXPOSE 50051
-ENTRYPOINT ["/threadweave"]
-CMD ["--config", "/etc/threadweave/threadweave.yaml"]
+ENTRYPOINT []
+CMD ["/threadweave-api", "--config", "/etc/threadweave/threadweave.yaml"]

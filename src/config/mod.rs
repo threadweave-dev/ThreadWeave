@@ -28,6 +28,7 @@ pub struct RedisConfig {
 pub struct BrokerConfig {
     pub key_prefix: String,
     pub task_destination: String,
+    pub worker_destination: String,
 }
 
 impl Config {
@@ -61,6 +62,7 @@ redis:
 broker:
   key_prefix: test:broker
   task_destination: test-tasks
+  worker_destination: test-workers
 "#,
         )
         .unwrap();
@@ -69,5 +71,6 @@ broker:
         assert_eq!(config.redis.url, "redis://localhost:6379/");
         assert_eq!(config.broker.key_prefix, "test:broker");
         assert_eq!(config.broker.task_destination, "test-tasks");
+        assert_eq!(config.broker.worker_destination, "test-workers");
     }
 }

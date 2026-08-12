@@ -1,15 +1,38 @@
 services:
-  threadweave:
+  api:
     build:
       context: ..
       dockerfile: ThreadWeave/Dockerfile
     image: threadweave:local
+    command: ["/threadweave-api", "--config", "/etc/threadweave/threadweave.yaml"]
     restart: unless-stopped
     depends_on:
       redis:
         condition: service_healthy
     ports:
       - "${THREADWEAVE_PORT:-50051}:50051"
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+
+  scheduler:
+    image: threadweave:local
+    command: ["/threadweave-scheduler", "--config", "/etc/threadweave/threadweave.yaml"]
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+
+  worker:
+    image: threadweave:local
+    command: ["/threadweave-worker", "--config", "/etc/threadweave/threadweave.yaml"]
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
     read_only: true
     security_opt:
       - no-new-privileges:true

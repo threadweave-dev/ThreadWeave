@@ -1,38 +1,9 @@
-use std::fmt;
-
 use async_trait::async_trait;
 use prost::Message;
 use redis::AsyncCommands;
 
+use super::{Broker, BrokerError};
 use crate::protocols::broker::v1::BrokerEnvelope;
-
-/// Failure reported by a broker implementation.
-#[derive(Debug)]
-pub struct BrokerError {
-    message: String,
-}
-
-impl BrokerError {
-    pub fn new(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-        }
-    }
-}
-
-impl fmt::Display for BrokerError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.message)
-    }
-}
-
-impl std::error::Error for BrokerError {}
-
-/// Transport abstraction used by the core. It deliberately exposes no Redis API.
-#[async_trait]
-pub trait Broker: Send + Sync + 'static {
-    async fn publish(&self, envelope: BrokerEnvelope) -> Result<(), BrokerError>;
-}
 
 /// Redis-backed POC broker. Each destination maps to one Redis list.
 #[derive(Clone)]
@@ -71,5 +42,19 @@ impl Broker for RedisBroker {
             .await
             .map_err(|error| BrokerError::new(format!("cannot publish to Redis: {error}")))?;
         Ok(())
+    }
+
+    async fn consume(&self, destination: &str) -> Result<BrokerEnvelope, BrokerError> {
+        let mut connection = self
+            .client
+            .get_multiplexed_async_connection()
+            .await
+            .map_err(|error| BrokerError::new(format!("cannot connect to Redis: {error}")))?;
+        let (_, payload): (String, Vec<u8>) = connection
+            .blpop(self.key(destination), 0.0)
+            .await
+            .map_err(|error| BrokerError::new(format!("cannot consume from Redis: {error}")))?;
+        BrokerEnvelope::decode(payload.as_slice())
+            .map_err(|error| BrokerError::new(format!("invalid broker envelope: {error}")))
     }
 }

@@ -9,7 +9,7 @@ homepage = "https://github.com/threadweave-dev/ThreadWeave"
 readme = "README.md"
 keywords = ["distributed", "scheduler", "execution", "runtime"]
 categories = ["concurrency", "command-line-utilities"]
-publish = false
+publish = ["crates-io"]
 
 [profile.release]
 codegen-units = 1
@@ -31,8 +31,7 @@ tokio = { version = "1", features = ["macros", "net", "rt-multi-thread"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 tonic = "0.14"
 tonic-prost = "0.14"
-threadweave-protocols-prost = { package = "threadweave_protocols_community_neoeinstein-prost", version = "=0.5.0-20260812095458-0316086fe476.2", registry = "buf" }
-threadweave-protocols-tonic = { package = "threadweave_protocols_community_neoeinstein-tonic", version = "=0.5.0-20260812095458-0316086fe476.4", registry = "buf" }
+threadweave-protocols = "=0.5.0"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 uuid = { version = "1", features = ["v4"] }

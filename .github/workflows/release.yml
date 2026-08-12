@@ -32,6 +32,9 @@ jobs:
       - name: Check out the repository
         uses: actions/checkout@v5
 
+      - name: Update ThreadWeave protocols
+        run: cargo update --package threadweave-protocols
+
       - name: Install the Rust target
         run: rustup target add ${{ matrix.target }}
 
@@ -91,6 +94,9 @@ jobs:
     steps:
       - name: Check out the repository
         uses: actions/checkout@v5
+
+      - name: Update ThreadWeave protocols
+        run: cargo update --package threadweave-protocols
 
       - name: Verify crate version matches the tag
         shell: bash

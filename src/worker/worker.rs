@@ -76,7 +76,7 @@ mod tests {
             ..Default::default()
         };
         let broker = Arc::new(TestBroker(Mutex::new(Some(BrokerEnvelope {
-            payload: assignment.encode_to_vec().into(),
+            payload: assignment.encode_to_vec(),
             ..Default::default()
         }))));
         let executed = Worker::new(broker, "workers.default")

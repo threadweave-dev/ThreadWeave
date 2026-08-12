@@ -26,6 +26,9 @@ jobs:
       - name: Check out the repository
         uses: actions/checkout@v5
 
+      - name: Update ThreadWeave protocols
+        run: cargo update --package threadweave-protocols
+
       - name: Install Rust tooling
         run: rustup component add clippy rustfmt
 
@@ -50,6 +53,9 @@ jobs:
     steps:
       - name: Check out the repository
         uses: actions/checkout@v5
+
+      - name: Update ThreadWeave protocols
+        run: cargo update --package threadweave-protocols
 
       - name: Run tests
         run: cargo test --all-targets --all-features

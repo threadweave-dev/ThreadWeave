@@ -73,7 +73,7 @@ impl Scheduler {
             destination: self.worker_destination.clone(),
             created_at: Some(prost_types::Timestamp::from(SystemTime::now())),
             expires_at: None,
-            payload: assignment.encode_to_vec().into(),
+            payload: assignment.encode_to_vec(),
             content_type: Some("application/protobuf".into()),
             correlation_id: Some(job_id),
             causation_id: Some(submitted.message_id),
@@ -114,13 +114,13 @@ mod tests {
         let request = SubmitTaskRequest {
             application_namespace: "dev".into(),
             task_name: "demo.add".into(),
-            arguments: vec![1].into(),
+            arguments: vec![1],
             serialization_format: "json".into(),
             ..Default::default()
         };
         let broker = Arc::new(TestBroker {
             incoming: Mutex::new(Some(BrokerEnvelope {
-                payload: request.encode_to_vec().into(),
+                payload: request.encode_to_vec(),
                 correlation_id: Some("job-1".into()),
                 message_id: "message-1".into(),
                 ..Default::default()

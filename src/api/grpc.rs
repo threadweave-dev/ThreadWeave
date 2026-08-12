@@ -56,7 +56,7 @@ impl CoreExecutionService {
             destination: self.task_destination.clone(),
             created_at: Some(now),
             expires_at: None,
-            payload: request.encode_to_vec().into(),
+            payload: request.encode_to_vec(),
             content_type: Some("application/protobuf".into()),
             correlation_id: Some(job_id.clone()),
             causation_id: request.parent_execution_id.clone(),
@@ -174,7 +174,7 @@ mod tests {
         SubmitTaskRequest {
             application_namespace: "development".into(),
             task_name: "demo.add".into(),
-            arguments: payload.into(),
+            arguments: payload,
             serialization_format: "json".into(),
             resources: None,
             idempotency_key: None,

@@ -34,7 +34,10 @@ use protocols::execution::v1::execution_service_server::{
     ExecutionService, ExecutionServiceServer,
 };
 use protocols::execution::v1::{
-    GetJobRequest, GetJobResponse, Job, JobState, SubmitTaskRequest, SubmitTaskResponse,
+    CancelJobRequest, CancelJobResponse, CommandResult, CommandStatus, GetExecutionRequest,
+    GetExecutionResponse, GetJobRequest, GetJobResponse, Job, JobState, ListExecutionsRequest,
+    ListExecutionsResponse, RegisterTaskRequest, RegisterTaskResponse, SubmitTaskRequest,
+    SubmitTaskResponse,
 };
 
 #[derive(Debug, Default)]
@@ -67,6 +70,13 @@ impl NoOpExecutionService {
                 updated_at: None,
                 attempt_number: 0,
                 metadata: request.metadata,
+                task: request.task,
+                parent_execution_id: request.parent_execution_id,
+                root_execution_id: None,
+            }),
+            result: Some(CommandResult {
+                status: CommandStatus::Accepted.into(),
+                error: None,
             }),
         }
     }
@@ -86,6 +96,34 @@ impl ExecutionService for NoOpExecutionService {
         _request: Request<GetJobRequest>,
     ) -> Result<Response<GetJobResponse>, Status> {
         Err(Status::unimplemented("GetJob is outside this POC"))
+    }
+
+    async fn register_task(
+        &self,
+        _request: Request<RegisterTaskRequest>,
+    ) -> Result<Response<RegisterTaskResponse>, Status> {
+        Err(Status::unimplemented("RegisterTask is outside this POC"))
+    }
+
+    async fn cancel_job(
+        &self,
+        _request: Request<CancelJobRequest>,
+    ) -> Result<Response<CancelJobResponse>, Status> {
+        Err(Status::unimplemented("CancelJob is outside this POC"))
+    }
+
+    async fn list_executions(
+        &self,
+        _request: Request<ListExecutionsRequest>,
+    ) -> Result<Response<ListExecutionsResponse>, Status> {
+        Err(Status::unimplemented("ListExecutions is outside this POC"))
+    }
+
+    async fn get_execution(
+        &self,
+        _request: Request<GetExecutionRequest>,
+    ) -> Result<Response<GetExecutionResponse>, Status> {
+        Err(Status::unimplemented("GetExecution is outside this POC"))
     }
 }
 
@@ -126,6 +164,11 @@ mod tests {
             resources: None,
             idempotency_key: None,
             metadata: None,
+            command_id: Uuid::new_v4().to_string(),
+            task: None,
+            parent_execution_id: None,
+            priority: None,
+            queue: None,
         }
     }
 

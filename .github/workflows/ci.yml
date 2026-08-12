@@ -21,6 +21,7 @@ jobs:
   quality:
     name: Format and lint
     runs-on: ubuntu-latest
+    environment: build
 
     steps:
       - name: Check out the repository
@@ -38,6 +39,7 @@ jobs:
   test:
     name: Test on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    environment: build
     strategy:
       fail-fast: false
       matrix:

@@ -80,6 +80,36 @@ Language runtimes are responsible only for executing user code.
 
 ThreadWeave is currently in active development.
 
+### Redis submission POC
+
+The Rust core currently implements the first submission boundary only:
+
+1. `SubmitTask` receives a protobuf command over gRPC.
+2. The core wraps it in a versioned `BrokerEnvelope`.
+3. The envelope is appended to the `threadweave:broker:tasks` Redis list.
+4. The job is returned as `ACCEPTED` only after Redis confirms the write.
+
+Start Redis and the core with:
+
+```bash
+docker compose up -d redis
+cargo run
+```
+
+By default, the core loads `threadweave.yaml`. Another configuration file can
+be selected from the CLI:
+
+```bash
+cargo run -- --config /path/to/threadweave.yaml
+```
+
+The YAML file configures the gRPC bind address, Redis URL, broker key prefix,
+and task destination. See `threadweave.yaml` for the default values.
+
+The broker is behind the `Broker` trait, and result storage has a separate
+`BackendResult` trait. Scheduling, consumption and result persistence are not
+implemented yet.
+
 The project is focused on building a solid architecture before implementing production features.
 
 Current priorities include:

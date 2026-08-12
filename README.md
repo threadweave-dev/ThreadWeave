@@ -92,8 +92,14 @@ The Rust core currently implements the first submission boundary only:
 Build the optimized image and start the complete stack with:
 
 ```bash
+export BUF_TOKEN="<your-buf-token>"
 docker compose up --build -d
 ```
+
+The token is used only as a BuildKit secret to download the generated Rust
+protocol crates from Buf; it is not stored in the image. For local Cargo
+commands, authenticate once with
+`cargo login --registry buf "Bearer <your-buf-token>"`.
 
 The gRPC service is then available at `localhost:50051`. Override the published
 port without rebuilding with, for example,

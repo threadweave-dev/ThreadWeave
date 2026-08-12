@@ -4,7 +4,7 @@ use prost::Message;
 use tracing::info;
 
 use crate::broker::{Broker, BrokerError};
-use crate::protocols::runtime::v1::ExecutionAssignment;
+use crate::protocols::runtime::v1::AssignExecutionRequest;
 
 pub struct Worker {
     broker: Arc<dyn Broker>,
@@ -26,10 +26,12 @@ impl Worker {
         }
     }
 
-    pub async fn execute_one(&self) -> Result<ExecutionAssignment, BrokerError> {
+    pub async fn execute_one(&self) -> Result<AssignExecutionRequest, BrokerError> {
         let envelope = self.broker.consume(&self.destination).await?;
-        let assignment = ExecutionAssignment::decode(envelope.payload.as_slice())
-            .map_err(|error| BrokerError::new(format!("invalid ExecutionAssignment: {error}")))?;
+        let assignment =
+            AssignExecutionRequest::decode(envelope.payload.as_ref()).map_err(|error| {
+                BrokerError::new(format!("invalid AssignExecutionRequest: {error}"))
+            })?;
         let task_name = assignment
             .task
             .as_ref()
@@ -65,7 +67,7 @@ mod tests {
     }
     #[tokio::test]
     async fn assignment_reaches_no_op_execution_path() {
-        let assignment = ExecutionAssignment {
+        let assignment = AssignExecutionRequest {
             execution_id: "execution-1".into(),
             task: Some(TaskIdentity {
                 name: "demo.add".into(),
@@ -74,7 +76,7 @@ mod tests {
             ..Default::default()
         };
         let broker = Arc::new(TestBroker(Mutex::new(Some(BrokerEnvelope {
-            payload: assignment.encode_to_vec(),
+            payload: assignment.encode_to_vec().into(),
             ..Default::default()
         }))));
         let executed = Worker::new(broker, "workers.default")

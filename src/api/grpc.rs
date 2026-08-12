@@ -50,13 +50,13 @@ impl CoreExecutionService {
         let job_id = Uuid::new_v4().to_string();
         let envelope = BrokerEnvelope {
             message_id: Uuid::new_v4().to_string(),
-            message_kind: "threadweave.execution.v1.SubmitTaskRequest".into(),
+            message_kind: "threadweave_protocols.execution.v1.SubmitTaskRequest".into(),
             schema_version: "v1".into(),
             source: "threadweave-api".into(),
             destination: self.task_destination.clone(),
             created_at: Some(now),
             expires_at: None,
-            payload: request.encode_to_vec(),
+            payload: request.encode_to_vec().into(),
             content_type: Some("application/protobuf".into()),
             correlation_id: Some(job_id.clone()),
             causation_id: request.parent_execution_id.clone(),
@@ -174,7 +174,7 @@ mod tests {
         SubmitTaskRequest {
             application_namespace: "development".into(),
             task_name: "demo.add".into(),
-            arguments: payload,
+            arguments: payload.into(),
             serialization_format: "json".into(),
             resources: None,
             idempotency_key: None,
@@ -200,7 +200,7 @@ mod tests {
         assert_eq!(envelopes.len(), 1);
         assert_eq!(envelopes[0].destination, "tasks");
         assert_eq!(
-            SubmitTaskRequest::decode(envelopes[0].payload.as_slice())
+            SubmitTaskRequest::decode(envelopes[0].payload.as_ref())
                 .unwrap()
                 .task_name,
             "demo.add"

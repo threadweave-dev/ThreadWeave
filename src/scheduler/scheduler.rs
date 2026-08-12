@@ -8,7 +8,7 @@ use uuid::Uuid;
 use crate::broker::{Broker, BrokerError};
 use crate::protocols::broker::v1::BrokerEnvelope;
 use crate::protocols::execution::v1::{SubmitTaskRequest, TaskIdentity};
-use crate::protocols::runtime::v1::ExecutionAssignment;
+use crate::protocols::runtime::v1::AssignExecutionRequest;
 
 pub struct Scheduler {
     broker: Arc<dyn Broker>,
@@ -36,9 +36,9 @@ impl Scheduler {
         }
     }
 
-    pub async fn schedule_one(&self) -> Result<ExecutionAssignment, BrokerError> {
+    pub async fn schedule_one(&self) -> Result<AssignExecutionRequest, BrokerError> {
         let submitted = self.broker.consume(&self.task_destination).await?;
-        let request = SubmitTaskRequest::decode(submitted.payload.as_slice())
+        let request = SubmitTaskRequest::decode(submitted.payload.as_ref())
             .map_err(|error| BrokerError::new(format!("invalid SubmitTaskRequest: {error}")))?;
         let job_id = submitted
             .correlation_id
@@ -46,7 +46,7 @@ impl Scheduler {
             .unwrap_or_else(|| Uuid::new_v4().to_string());
         info!(%job_id, task = %request.task_name, "received task");
 
-        let assignment = ExecutionAssignment {
+        let assignment = AssignExecutionRequest {
             assignment_id: Uuid::new_v4().to_string(),
             execution_id: Uuid::new_v4().to_string(),
             job_id: job_id.clone(),
@@ -67,13 +67,13 @@ impl Scheduler {
         info!(execution_id = %assignment.execution_id, destination = %self.worker_destination, "selected worker destination");
         let envelope = BrokerEnvelope {
             message_id: Uuid::new_v4().to_string(),
-            message_kind: "threadweave.runtime.v1.ExecutionAssignment".into(),
+            message_kind: "threadweave_protocols.runtime.v1.AssignExecutionRequest".into(),
             schema_version: "v1".into(),
             source: "threadweave-scheduler".into(),
             destination: self.worker_destination.clone(),
             created_at: Some(prost_types::Timestamp::from(SystemTime::now())),
             expires_at: None,
-            payload: assignment.encode_to_vec(),
+            payload: assignment.encode_to_vec().into(),
             content_type: Some("application/protobuf".into()),
             correlation_id: Some(job_id),
             causation_id: Some(submitted.message_id),
@@ -114,13 +114,13 @@ mod tests {
         let request = SubmitTaskRequest {
             application_namespace: "dev".into(),
             task_name: "demo.add".into(),
-            arguments: vec![1],
+            arguments: vec![1].into(),
             serialization_format: "json".into(),
             ..Default::default()
         };
         let broker = Arc::new(TestBroker {
             incoming: Mutex::new(Some(BrokerEnvelope {
-                payload: request.encode_to_vec(),
+                payload: request.encode_to_vec().into(),
                 correlation_id: Some("job-1".into()),
                 message_id: "message-1".into(),
                 ..Default::default()
@@ -136,7 +136,7 @@ mod tests {
         let outgoing = broker.outgoing.lock().unwrap();
         assert_eq!(outgoing[0].destination, "workers.default");
         assert_eq!(
-            ExecutionAssignment::decode(outgoing[0].payload.as_slice())
+            AssignExecutionRequest::decode(outgoing[0].payload.as_ref())
                 .unwrap()
                 .execution_id,
             assignment.execution_id

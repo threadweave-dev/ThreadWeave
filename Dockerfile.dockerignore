@@ -1,7 +1,6 @@
 **
 !ThreadWeave/Cargo.toml
 !ThreadWeave/Cargo.lock
-!ThreadWeave/build.rs
+!ThreadWeave/.cargo/**
 !ThreadWeave/src/**
 !ThreadWeave/docker/threadweave.yaml
-!ThreadWeave-protocols/proto/**

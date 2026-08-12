@@ -3,6 +3,8 @@ services:
     build:
       context: ..
       dockerfile: ThreadWeave/Dockerfile
+      secrets:
+        - buf_token
     image: threadweave:local
     command: ["/threadweave-api", "--config", "/etc/threadweave/threadweave.yaml"]
     restart: unless-stopped
@@ -52,3 +54,7 @@ services:
 
 volumes:
   threadweave-redis:
+
+secrets:
+  buf_token:
+    environment: BUF_TOKEN

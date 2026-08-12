@@ -11,6 +11,13 @@ keywords = ["distributed", "scheduler", "execution", "runtime"]
 categories = ["concurrency", "command-line-utilities"]
 publish = ["crates-io"]
 
+[profile.release]
+codegen-units = 1
+lto = "fat"
+opt-level = 3
+panic = "abort"
+strip = "symbols"
+
 [dependencies]
 async-trait = "0.1"
 clap = { version = "4", features = ["derive"] }

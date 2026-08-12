@@ -1,0 +1,9 @@
+server:
+  bind_address: 0.0.0.0:50051
+
+redis:
+  url: redis://redis:6379/
+
+broker:
+  key_prefix: threadweave:broker
+  task_destination: tasks

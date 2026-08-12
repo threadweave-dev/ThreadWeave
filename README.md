@@ -89,7 +89,23 @@ The Rust core currently implements the first submission boundary only:
 3. The envelope is appended to the `threadweave:broker:tasks` Redis list.
 4. The job is returned as `ACCEPTED` only after Redis confirms the write.
 
-Start Redis and the core with:
+Build the optimized image and start the complete stack with:
+
+```bash
+docker compose up --build -d
+```
+
+The gRPC service is then available at `localhost:50051`. Override the published
+port without rebuilding with, for example,
+`THREADWEAVE_PORT=6000 docker compose up --build -d`. Use
+`docker compose logs -f threadweave` to follow the engine and
+`docker compose down` to stop the stack (add `-v` to also remove Redis data).
+
+The image uses a multi-stage build: the Rust toolchain stays in the build stage
+and the final static image contains only the optimized binary and its
+configuration. It runs unprivileged with a read-only filesystem.
+
+For local development outside Docker, start Redis only and then the core:
 
 ```bash
 docker compose up -d redis

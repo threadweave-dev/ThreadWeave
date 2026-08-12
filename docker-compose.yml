@@ -1,9 +1,29 @@
 services:
+  threadweave:
+    build:
+      context: ..
+      dockerfile: ThreadWeave/Dockerfile
+    image: threadweave:local
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+    ports:
+      - "${THREADWEAVE_PORT:-50051}:50051"
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+
   redis:
     image: redis:7-alpine
+    restart: unless-stopped
     command: redis-server --appendonly yes
-    ports:
-      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+      start_period: 2s
     volumes:
       - threadweave-redis:/data
 

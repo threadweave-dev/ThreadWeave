@@ -89,7 +89,26 @@ Le moteur Rust implémente actuellement uniquement la première étape de soumis
 3. L'enveloppe est ajoutée à la liste Redis `threadweave:broker:tasks`.
 4. Le Job est renvoyé avec l'état `ACCEPTED` seulement après confirmation de Redis.
 
-Pour démarrer Redis et le moteur :
+Pour construire l'image optimisée et démarrer toute la stack :
+
+```bash
+docker compose up --build -d
+```
+
+Le service gRPC est alors disponible sur `localhost:50051`. Le port peut être
+modifié, sans reconstruire l'image, avec par exemple
+`THREADWEAVE_PORT=6000 docker compose up --build -d`. Utilisez
+`docker compose logs -f threadweave` pour suivre le moteur et
+`docker compose down` pour arrêter la stack (ajoutez `-v` pour supprimer aussi
+les données Redis).
+
+L'image est construite en plusieurs étapes : la toolchain Rust reste dans
+l'étape de compilation et l'image finale, statique, ne contient que le binaire
+optimisé et sa configuration. Elle s'exécute sans privilèges et avec un système
+de fichiers en lecture seule.
+
+Pour le développement local sans conteneur, démarrez uniquement Redis puis le
+moteur :
 
 ```bash
 docker compose up -d redis

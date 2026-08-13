@@ -92,14 +92,11 @@ Le moteur Rust implémente actuellement uniquement la première étape de soumis
 Pour construire l'image optimisée et démarrer toute la stack :
 
 ```bash
-export BUF_TOKEN="<votre-jeton-buf>"
 docker compose up --build -d
 ```
 
-Le jeton est uniquement transmis comme secret BuildKit pour télécharger depuis
-Buf les crates Rust générés du protocole ; il n'est pas conservé dans l'image.
-Pour les commandes Cargo locales, authentifiez-vous une fois avec
-`cargo login --registry buf "Bearer <votre-jeton-buf>"`.
+La crate de protocoles Rust générée est téléchargée depuis crates.io ; la
+construction de l'image ne nécessite donc aucun identifiant de registre.
 
 Le service gRPC est alors disponible sur `localhost:50051`. Le port peut être
 modifié, sans reconstruire l'image, avec par exemple

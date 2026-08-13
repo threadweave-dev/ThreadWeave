@@ -7,14 +7,12 @@ WORKDIR /build/ThreadWeave
 
 # Keep dependency compilation cached when only application sources change.
 COPY ThreadWeave/Cargo.toml ThreadWeave/Cargo.lock ./
-COPY ThreadWeave/.cargo ./.cargo
 COPY ThreadWeave/src ./src
 
-RUN --mount=type=secret,id=buf_token,env=BUF_TOKEN \
-    --mount=type=cache,id=threadweave-cargo-registry,target=/usr/local/cargo/registry \
+RUN --mount=type=cache,id=threadweave-cargo-registry,target=/usr/local/cargo/registry \
     --mount=type=cache,id=threadweave-cargo-git,target=/usr/local/cargo/git \
     --mount=type=cache,id=threadweave-target,target=/build/ThreadWeave/target \
-    CARGO_REGISTRIES_BUF_TOKEN="Bearer ${BUF_TOKEN}" cargo build --locked --release --bins && \
+    cargo build --locked --release --bins && \
     cp target/release/threadweave-api /threadweave-api && \
     cp target/release/threadweave-scheduler /threadweave-scheduler && \
     cp target/release/threadweave-worker /threadweave-worker && \

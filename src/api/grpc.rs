@@ -18,20 +18,27 @@ use crate::protocols::execution::v1::execution_service_server::{
 };
 use crate::protocols::execution::v1::{
     CancelJobRequest, CancelJobResponse, CommandResult, CommandStatus, GetExecutionRequest,
-    GetExecutionResponse, GetJobRequest, GetJobResponse, Job, JobState, ListExecutionsRequest,
-    ListExecutionsResponse, RegisterTaskRequest, RegisterTaskResponse, SubmitTaskRequest,
-    SubmitTaskResponse,
+    GetExecutionResponse, GetJobRequest, GetJobResponse, Job, JobResult, JobState,
+    ListExecutionsRequest, ListExecutionsResponse, RegisterTaskRequest, RegisterTaskResponse,
+    SubmitTaskRequest, SubmitTaskResponse,
 };
+use crate::result_backend::{BackendResult, RedisResultBackend, ResultBackendError};
 
 pub struct CoreExecutionService {
     broker: Arc<dyn Broker>,
+    result_backend: Arc<dyn BackendResult<Error = ResultBackendError>>,
     task_destination: String,
 }
 
 impl CoreExecutionService {
-    pub fn new(broker: Arc<dyn Broker>, task_destination: impl Into<String>) -> Self {
+    pub fn new(
+        broker: Arc<dyn Broker>,
+        result_backend: Arc<dyn BackendResult<Error = ResultBackendError>>,
+        task_destination: impl Into<String>,
+    ) -> Self {
         Self {
             broker,
+            result_backend,
             task_destination: task_destination.into(),
         }
     }
@@ -69,6 +76,25 @@ impl CoreExecutionService {
             Status::unavailable("task broker is unavailable")
         })?;
 
+        let command_result = CommandResult {
+            status: CommandStatus::Accepted.into(),
+            error: None,
+        };
+        self.result_backend
+            .store_result(
+                &job_id,
+                &JobResult {
+                    payload: command_result.encode_to_vec(),
+                    serialization_format: "application/protobuf".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(|error| {
+                tracing::error!(%error, %job_id, "failed to store task result");
+                Status::unavailable("result backend is unavailable")
+            })?;
+
         Ok(SubmitTaskResponse {
             job: Some(Job {
                 job_id,
@@ -83,10 +109,7 @@ impl CoreExecutionService {
                 parent_execution_id: request.parent_execution_id,
                 root_execution_id: None,
             }),
-            result: Some(CommandResult {
-                status: CommandStatus::Accepted.into(),
-                error: None,
-            }),
+            result: Some(command_result),
         })
     }
 }
@@ -132,7 +155,11 @@ pub async fn serve(
     config: Config,
     broker: Arc<dyn Broker>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let service = CoreExecutionService::new(broker, config.broker.task_destination);
+    let result_backend = Arc::new(RedisResultBackend::new(
+        &config.redis.url,
+        format!("{}:results", config.broker.key_prefix),
+    )?);
+    let service = CoreExecutionService::new(broker, result_backend, config.broker.task_destination);
     let listener = TcpListener::bind(&config.server.bind_address).await?;
     let address = listener.local_addr()?;
     announce_ready(address)?;
@@ -159,6 +186,22 @@ mod tests {
     #[derive(Default)]
     struct RecordingBroker {
         envelopes: Mutex<Vec<BrokerEnvelope>>,
+    }
+    #[derive(Default)]
+    struct RecordingResultBackend {
+        results: Mutex<Vec<(String, JobResult)>>,
+    }
+    #[tonic::async_trait]
+    impl BackendResult for RecordingResultBackend {
+        type Error = ResultBackendError;
+
+        async fn store_result(&self, job_id: &str, result: &JobResult) -> Result<(), Self::Error> {
+            self.results
+                .lock()
+                .unwrap()
+                .push((job_id.to_owned(), result.clone()));
+            Ok(())
+        }
     }
     #[tonic::async_trait]
     impl Broker for RecordingBroker {
@@ -189,7 +232,8 @@ mod tests {
     #[tokio::test]
     async fn submit_task_is_published_before_it_is_accepted() {
         let broker = Arc::new(RecordingBroker::default());
-        let response = CoreExecutionService::new(broker.clone(), "tasks")
+        let result_backend = Arc::new(RecordingResultBackend::default());
+        let response = CoreExecutionService::new(broker.clone(), result_backend.clone(), "tasks")
             .accept(request(br#"{"args":[1,2]}"#.to_vec()))
             .await
             .unwrap();
@@ -205,13 +249,20 @@ mod tests {
                 .task_name,
             "demo.add"
         );
+        let results = result_backend.results.lock().unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, job.job_id);
     }
     #[tokio::test]
     async fn empty_payload_is_accepted() {
-        let response = CoreExecutionService::new(Arc::new(RecordingBroker::default()), "tasks")
-            .accept(request(Vec::new()))
-            .await
-            .unwrap();
+        let response = CoreExecutionService::new(
+            Arc::new(RecordingBroker::default()),
+            Arc::new(RecordingResultBackend::default()),
+            "tasks",
+        )
+        .accept(request(Vec::new()))
+        .await
+        .unwrap();
         assert!(response.job.is_some());
     }
 }

@@ -4,7 +4,7 @@ services:
       context: ..
       dockerfile: ThreadWeave/Dockerfile
     image: threadweave:local
-    command: ["/threadweave-api", "--config", "/etc/threadweave/threadweave.yaml"]
+    command: ["/threadweave-api", "--config", "/etc/threadweave/threadweave.yaml", "--json"]
     restart: unless-stopped
     depends_on:
       redis:

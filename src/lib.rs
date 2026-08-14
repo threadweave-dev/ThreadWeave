@@ -4,4 +4,5 @@ pub mod config;
 pub mod protocols;
 pub mod result_backend;
 pub mod scheduler;
+pub mod startup;
 pub mod worker;

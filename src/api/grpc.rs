@@ -1,6 +1,7 @@
+use std::collections::HashMap;
 use std::io::{self, Write};
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::SystemTime;
 
 use prost::Message;
@@ -28,6 +29,15 @@ pub struct CoreExecutionService {
     broker: Arc<dyn Broker>,
     result_backend: Arc<dyn BackendResult<Error = ResultBackendError>>,
     task_destination: String,
+    jobs: Arc<RwLock<HashMap<String, JobRecord>>>,
+}
+
+#[derive(Clone)]
+struct JobRecord {
+    job: Job,
+    result: Option<JobResult>,
+    // Retained for the worker handoff that will be added after this POC.
+    _request: SubmitTaskRequest,
 }
 
 impl CoreExecutionService {
@@ -40,7 +50,43 @@ impl CoreExecutionService {
             broker,
             result_backend,
             task_destination: task_destination.into(),
+            jobs: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    /// Records that a worker has started the first execution attempt.
+    pub fn mark_job_running(&self, job_id: &str) -> Result<(), Status> {
+        let mut jobs = self
+            .jobs
+            .write()
+            .map_err(|_| Status::internal("job store lock is poisoned"))?;
+        let record = jobs
+            .get_mut(job_id)
+            .ok_or_else(|| Status::not_found("job not found"))?;
+        record.job.state = JobState::Running.into();
+        record.job.attempt_number = 1;
+        record.job.updated_at = Some(SystemTime::now().into());
+        Ok(())
+    }
+
+    /// Stores a terminal worker outcome and derives the canonical job state from it.
+    pub fn store_job_result(&self, job_id: &str, result: JobResult) -> Result<(), Status> {
+        let mut jobs = self
+            .jobs
+            .write()
+            .map_err(|_| Status::internal("job store lock is poisoned"))?;
+        let record = jobs
+            .get_mut(job_id)
+            .ok_or_else(|| Status::not_found("job not found"))?;
+        record.job.state = if result.failure.is_some() {
+            JobState::Failed.into()
+        } else {
+            JobState::Succeeded.into()
+        };
+        record.job.attempt_number = record.job.attempt_number.max(1);
+        record.job.updated_at = Some(SystemTime::now().into());
+        record.result = Some(result);
+        Ok(())
     }
 
     async fn accept(&self, request: SubmitTaskRequest) -> Result<SubmitTaskResponse, Status> {
@@ -95,20 +141,33 @@ impl CoreExecutionService {
                 Status::unavailable("result backend is unavailable")
             })?;
 
-        Ok(SubmitTaskResponse {
-            job: Some(Job {
+        let job = Job {
+            job_id: job_id.clone(),
+            application_namespace: request.application_namespace.clone(),
+            task_name: request.task_name.clone(),
+            state: JobState::Accepted.into(),
+            created_at: Some(now),
+            updated_at: Some(now),
+            attempt_number: 0,
+            metadata: request.metadata.clone(),
+            task: request.task.clone(),
+            parent_execution_id: request.parent_execution_id.clone(),
+            root_execution_id: None,
+        };
+        self.jobs
+            .write()
+            .map_err(|_| Status::internal("job store lock is poisoned"))?
+            .insert(
                 job_id,
-                application_namespace: request.application_namespace,
-                task_name: request.task_name,
-                state: JobState::Accepted.into(),
-                created_at: Some(now),
-                updated_at: Some(now),
-                attempt_number: 0,
-                metadata: request.metadata,
-                task: request.task,
-                parent_execution_id: request.parent_execution_id,
-                root_execution_id: None,
-            }),
+                JobRecord {
+                    job: job.clone(),
+                    result: None,
+                    _request: request,
+                },
+            );
+
+        Ok(SubmitTaskResponse {
+            job: Some(job),
             result: Some(command_result),
         })
     }
@@ -122,8 +181,22 @@ impl ExecutionService for CoreExecutionService {
     ) -> Result<Response<SubmitTaskResponse>, Status> {
         Ok(Response::new(self.accept(request.into_inner()).await?))
     }
-    async fn get_job(&self, _: Request<GetJobRequest>) -> Result<Response<GetJobResponse>, Status> {
-        Err(Status::unimplemented("GetJob is outside this POC"))
+    async fn get_job(
+        &self,
+        request: Request<GetJobRequest>,
+    ) -> Result<Response<GetJobResponse>, Status> {
+        let job_id = request.into_inner().job_id;
+        let jobs = self
+            .jobs
+            .read()
+            .map_err(|_| Status::internal("job store lock is poisoned"))?;
+        let record = jobs
+            .get(&job_id)
+            .ok_or_else(|| Status::not_found("job not found"))?;
+        Ok(Response::new(GetJobResponse {
+            job: Some(record.job.clone()),
+            result: record.result.clone(),
+        }))
     }
     async fn register_task(
         &self,
@@ -181,6 +254,7 @@ fn announce_ready(address: SocketAddr) -> io::Result<()> {
 mod tests {
     use super::*;
     use crate::broker::BrokerError;
+    use crate::protocols::common::v1::Error;
     use std::sync::Mutex;
 
     #[derive(Default)]
@@ -264,5 +338,108 @@ mod tests {
         .await
         .unwrap();
         assert!(response.job.is_some());
+    }
+
+    #[tokio::test]
+    async fn get_job_returns_an_accepted_job() {
+        let service = CoreExecutionService::new(
+            Arc::new(RecordingBroker::default()),
+            Arc::new(RecordingResultBackend::default()),
+            "tasks",
+        );
+        let submitted = service.accept(request(Vec::new())).await.unwrap();
+        let job_id = submitted.job.unwrap().job_id;
+
+        let response = service
+            .get_job(Request::new(GetJobRequest { job_id }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert_eq!(response.job.unwrap().state, i32::from(JobState::Accepted));
+        assert!(response.result.is_none());
+    }
+
+    #[tokio::test]
+    async fn get_job_returns_not_found_for_an_unknown_job() {
+        let service = CoreExecutionService::new(
+            Arc::new(RecordingBroker::default()),
+            Arc::new(RecordingResultBackend::default()),
+            "tasks",
+        );
+
+        let status = service
+            .get_job(Request::new(GetJobRequest {
+                job_id: "missing".into(),
+            }))
+            .await
+            .unwrap_err();
+
+        assert_eq!(status.code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn successful_result_is_stored_and_returned() {
+        let service = CoreExecutionService::new(
+            Arc::new(RecordingBroker::default()),
+            Arc::new(RecordingResultBackend::default()),
+            "tasks",
+        );
+        let job_id = service
+            .accept(request(Vec::new()))
+            .await
+            .unwrap()
+            .job
+            .unwrap()
+            .job_id;
+        let result = JobResult {
+            payload: br#"{"value":3}"#.to_vec(),
+            serialization_format: "json".into(),
+            ..Default::default()
+        };
+
+        service.store_job_result(&job_id, result.clone()).unwrap();
+        let response = service
+            .get_job(Request::new(GetJobRequest { job_id }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert_eq!(response.job.unwrap().state, i32::from(JobState::Succeeded));
+        assert_eq!(response.result, Some(result));
+    }
+
+    #[tokio::test]
+    async fn failed_result_is_stored_and_returned() {
+        let service = CoreExecutionService::new(
+            Arc::new(RecordingBroker::default()),
+            Arc::new(RecordingResultBackend::default()),
+            "tasks",
+        );
+        let job_id = service
+            .accept(request(Vec::new()))
+            .await
+            .unwrap()
+            .job
+            .unwrap()
+            .job_id;
+        let result = JobResult {
+            failure: Some(Error {
+                code: "TASK_FAILED".into(),
+                message: "worker reported failure".into(),
+                metadata: None,
+            }),
+            ..Default::default()
+        };
+
+        service.store_job_result(&job_id, result.clone()).unwrap();
+        let response = service
+            .get_job(Request::new(GetJobRequest { job_id }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert_eq!(response.job.unwrap().state, i32::from(JobState::Failed));
+        assert_eq!(response.result, Some(result));
     }
 }

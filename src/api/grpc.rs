@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::io::{self, Write};
 use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use prost::Message;
 use tokio::net::TcpListener;
@@ -23,8 +23,16 @@ use crate::protocols::execution::v1::{
     ListExecutionsRequest, ListExecutionsResponse, RegisterTaskRequest, RegisterTaskResponse,
     SubmitTaskRequest, SubmitTaskResponse,
 };
+use crate::protocols::runtime::v1::runtime_service_server::{RuntimeService, RuntimeServiceServer};
+use crate::protocols::runtime::v1::{
+    AcquireExecutionRequest, AcquireExecutionResponse, AssignExecutionRequest,
+    AssignExecutionResponse, RegisterRuntimeRequest, RegisterRuntimeResponse,
+    RegisterWorkerRequest, RegisterWorkerResponse, ReportExecutionRequest, ReportExecutionResponse,
+    ReportHeartbeatRequest, ReportHeartbeatResponse,
+};
 use crate::result_backend::{BackendResult, RedisResultBackend, ResultBackendError};
 
+#[derive(Clone)]
 pub struct CoreExecutionService {
     broker: Arc<dyn Broker>,
     result_backend: Arc<dyn BackendResult<Error = ResultBackendError>>,
@@ -36,8 +44,7 @@ pub struct CoreExecutionService {
 struct JobRecord {
     job: Job,
     result: Option<JobResult>,
-    // Retained for the worker handoff that will be added after this POC.
-    _request: SubmitTaskRequest,
+    execution_id: Option<String>,
 }
 
 impl CoreExecutionService {
@@ -87,6 +94,63 @@ impl CoreExecutionService {
         record.job.updated_at = Some(SystemTime::now().into());
         record.result = Some(result);
         Ok(())
+    }
+
+    async fn acquire(&self) -> Result<Option<AssignExecutionRequest>, Status> {
+        let submitted = match tokio::time::timeout(
+            Duration::from_secs(30),
+            self.broker.consume(&self.task_destination),
+        )
+        .await
+        {
+            Err(_) => return Ok(None),
+            Ok(result) => result,
+        }
+        .map_err(|error| {
+            tracing::error!(%error, "failed to acquire submitted task");
+            Status::unavailable("task broker is unavailable")
+        })?;
+        let request = SubmitTaskRequest::decode(submitted.payload.as_ref())
+            .map_err(|error| Status::internal(format!("invalid submitted task: {error}")))?;
+        let job_id = submitted
+            .correlation_id
+            .ok_or_else(|| Status::internal("submitted task has no job id"))?;
+        let execution_id = Uuid::new_v4().to_string();
+        let application = request
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.entries.get("application"))
+            .cloned()
+            .unwrap_or_default();
+        let assignment = AssignExecutionRequest {
+            assignment_id: Uuid::new_v4().to_string(),
+            execution_id: execution_id.clone(),
+            job_id: job_id.clone(),
+            task: request.task.clone().or_else(|| {
+                Some(crate::protocols::execution::v1::TaskIdentity {
+                    namespace: request.application_namespace.clone(),
+                    application,
+                    name: request.task_name.clone(),
+                    version: String::new(),
+                })
+            }),
+            arguments: request.arguments,
+            serialization_format: request.serialization_format,
+            reserved_resources: request.resources,
+            deadline: None,
+            metadata: request.metadata,
+        };
+        let mut jobs = self
+            .jobs
+            .write()
+            .map_err(|_| Status::internal("job store lock is poisoned"))?;
+        let record = jobs
+            .get_mut(&job_id)
+            .ok_or_else(|| Status::not_found("job not found"))?;
+        record.execution_id = Some(execution_id);
+        record.job.attempt_number = 1;
+        record.job.updated_at = Some(SystemTime::now().into());
+        Ok(Some(assignment))
     }
 
     async fn accept(&self, request: SubmitTaskRequest) -> Result<SubmitTaskResponse, Status> {
@@ -162,7 +226,7 @@ impl CoreExecutionService {
                 JobRecord {
                     job: job.clone(),
                     result: None,
-                    _request: request,
+                    execution_id: None,
                 },
             );
 
@@ -170,6 +234,95 @@ impl CoreExecutionService {
             job: Some(job),
             result: Some(command_result),
         })
+    }
+}
+
+#[tonic::async_trait]
+impl RuntimeService for CoreExecutionService {
+    async fn acquire_execution(
+        &self,
+        _request: Request<AcquireExecutionRequest>,
+    ) -> Result<Response<AcquireExecutionResponse>, Status> {
+        Ok(Response::new(AcquireExecutionResponse {
+            assignment: self.acquire().await?,
+        }))
+    }
+
+    async fn report_execution(
+        &self,
+        request: Request<ReportExecutionRequest>,
+    ) -> Result<Response<ReportExecutionResponse>, Status> {
+        let report = request.into_inner();
+        let state = crate::protocols::execution::v1::ExecutionState::try_from(report.state)
+            .map_err(|_| Status::invalid_argument("unknown execution state"))?;
+        let job_id = {
+            let jobs = self
+                .jobs
+                .read()
+                .map_err(|_| Status::internal("job store lock is poisoned"))?;
+            jobs.iter()
+                .find(|(_, record)| record.execution_id.as_deref() == Some(&report.execution_id))
+                .map(|(job_id, _)| job_id.clone())
+                .ok_or_else(|| Status::not_found("execution not found"))?
+        };
+        match state {
+            crate::protocols::execution::v1::ExecutionState::Running => {
+                self.mark_job_running(&job_id)?;
+            }
+            crate::protocols::execution::v1::ExecutionState::Succeeded
+            | crate::protocols::execution::v1::ExecutionState::Failed => {
+                let mut outcome = report.outcome.ok_or_else(|| {
+                    Status::invalid_argument("terminal report requires an outcome")
+                })?;
+                if state == crate::protocols::execution::v1::ExecutionState::Failed
+                    && outcome.failure.is_none()
+                {
+                    return Err(Status::invalid_argument(
+                        "failed report requires failure information",
+                    ));
+                }
+                outcome.execution_id = report.execution_id;
+                self.result_backend
+                    .store_result(&job_id, &outcome)
+                    .await
+                    .map_err(|error| {
+                        tracing::error!(%error, %job_id, "failed to persist execution result");
+                        Status::unavailable("result backend is unavailable")
+                    })?;
+                self.store_job_result(&job_id, outcome)?;
+            }
+            _ => {
+                return Err(Status::invalid_argument(
+                    "unsupported execution report state",
+                ));
+            }
+        }
+        Ok(Response::new(ReportExecutionResponse { accepted: true }))
+    }
+
+    async fn register_runtime(
+        &self,
+        _: Request<RegisterRuntimeRequest>,
+    ) -> Result<Response<RegisterRuntimeResponse>, Status> {
+        Err(Status::unimplemented("RegisterRuntime is outside this POC"))
+    }
+    async fn report_heartbeat(
+        &self,
+        _: Request<ReportHeartbeatRequest>,
+    ) -> Result<Response<ReportHeartbeatResponse>, Status> {
+        Err(Status::unimplemented("ReportHeartbeat is outside this POC"))
+    }
+    async fn register_worker(
+        &self,
+        _: Request<RegisterWorkerRequest>,
+    ) -> Result<Response<RegisterWorkerResponse>, Status> {
+        Err(Status::unimplemented("RegisterWorker is outside this POC"))
+    }
+    async fn assign_execution(
+        &self,
+        _: Request<AssignExecutionRequest>,
+    ) -> Result<Response<AssignExecutionResponse>, Status> {
+        Err(Status::unimplemented("push assignment is outside this POC"))
     }
 }
 
@@ -237,7 +390,8 @@ pub async fn serve(
     let address = listener.local_addr()?;
     announce_ready(address)?;
     tonic::transport::Server::builder()
-        .add_service(ExecutionServiceServer::new(service))
+        .add_service(ExecutionServiceServer::new(service.clone()))
+        .add_service(RuntimeServiceServer::new(service))
         .serve_with_incoming(TcpListenerStream::new(listener))
         .await?;
     Ok(())
@@ -255,6 +409,7 @@ mod tests {
     use super::*;
     use crate::broker::BrokerError;
     use crate::protocols::common::v1::Error;
+    use crate::protocols::execution::v1::ExecutionState;
     use std::sync::Mutex;
 
     #[derive(Default)]
@@ -284,7 +439,11 @@ mod tests {
             Ok(())
         }
         async fn consume(&self, _: &str) -> Result<BrokerEnvelope, BrokerError> {
-            unreachable!()
+            let mut envelopes = self.envelopes.lock().unwrap();
+            if envelopes.is_empty() {
+                return Err(BrokerError::new("empty"));
+            }
+            Ok(envelopes.remove(0))
         }
     }
     fn request(payload: Vec<u8>) -> SubmitTaskRequest {
@@ -441,5 +600,125 @@ mod tests {
 
         assert_eq!(response.job.unwrap().state, i32::from(JobState::Failed));
         assert_eq!(response.result, Some(result));
+    }
+
+    async fn acquire_submitted(service: &CoreExecutionService) -> (String, AssignExecutionRequest) {
+        let job_id = service
+            .accept(request(br#"{"args":[1,2]}"#.to_vec()))
+            .await
+            .unwrap()
+            .job
+            .unwrap()
+            .job_id;
+        let assignment = service
+            .acquire_execution(Request::new(AcquireExecutionRequest::default()))
+            .await
+            .unwrap()
+            .into_inner()
+            .assignment
+            .unwrap();
+        (job_id, assignment)
+    }
+
+    async fn report(
+        service: &CoreExecutionService,
+        assignment: &AssignExecutionRequest,
+        state: ExecutionState,
+        outcome: Option<JobResult>,
+    ) {
+        service
+            .report_execution(Request::new(ReportExecutionRequest {
+                report_id: Uuid::new_v4().to_string(),
+                assignment_id: assignment.assignment_id.clone(),
+                execution_id: assignment.execution_id.clone(),
+                sequence_number: 1,
+                state: state.into(),
+                outcome,
+                observed_at: Some(SystemTime::now().into()),
+            }))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn worker_can_acquire_start_complete_and_observe_success() {
+        let service = CoreExecutionService::new(
+            Arc::new(RecordingBroker::default()),
+            Arc::new(RecordingResultBackend::default()),
+            "tasks",
+        );
+        let (job_id, assignment) = acquire_submitted(&service).await;
+        assert_eq!(assignment.job_id, job_id);
+        assert_eq!(assignment.task.as_ref().unwrap().name, "demo.add");
+        assert_eq!(assignment.arguments, br#"{"args":[1,2]}"#);
+        assert_eq!(assignment.serialization_format, "json");
+
+        report(&service, &assignment, ExecutionState::Running, None).await;
+        let running = service
+            .get_job(Request::new(GetJobRequest {
+                job_id: job_id.clone(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(running.job.unwrap().state, i32::from(JobState::Running));
+
+        let result = JobResult {
+            payload: br#"{"value":3}"#.to_vec(),
+            serialization_format: "json".into(),
+            ..Default::default()
+        };
+        report(
+            &service,
+            &assignment,
+            ExecutionState::Succeeded,
+            Some(result.clone()),
+        )
+        .await;
+        let completed = service
+            .get_job(Request::new(GetJobRequest { job_id }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(completed.job.unwrap().state, i32::from(JobState::Succeeded));
+        assert_eq!(completed.result.as_ref().unwrap().payload, result.payload);
+        assert_eq!(
+            completed.result.unwrap().execution_id,
+            assignment.execution_id
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_can_acquire_start_fail_and_observe_failure() {
+        let service = CoreExecutionService::new(
+            Arc::new(RecordingBroker::default()),
+            Arc::new(RecordingResultBackend::default()),
+            "tasks",
+        );
+        let (job_id, assignment) = acquire_submitted(&service).await;
+        report(&service, &assignment, ExecutionState::Running, None).await;
+        let failure = Error {
+            code: "PYTHON_EXCEPTION".into(),
+            message: "ValueError: bad input".into(),
+            metadata: None,
+        };
+        report(
+            &service,
+            &assignment,
+            ExecutionState::Failed,
+            Some(JobResult {
+                failure: Some(failure.clone()),
+                ..Default::default()
+            }),
+        )
+        .await;
+
+        let failed = service
+            .get_job(Request::new(GetJobRequest { job_id }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(failed.job.unwrap().state, i32::from(JobState::Failed));
+        assert_eq!(failed.result.unwrap().failure, Some(failure));
     }
 }

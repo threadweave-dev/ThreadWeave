@@ -1,6 +1,7 @@
 pub mod api;
 pub mod broker;
 pub mod config;
+pub mod execution_store;
 pub mod protocols;
 pub mod result_backend;
 pub mod scheduler;

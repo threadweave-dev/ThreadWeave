@@ -13,6 +13,7 @@ use uuid::Uuid;
 
 use crate::broker::Broker;
 use crate::config::Config;
+use crate::execution_store::{ExecutionStore, MemoryExecutionStore, RedisExecutionStore};
 use crate::protocols::broker::v1::BrokerEnvelope;
 use crate::protocols::execution::v1::execution_service_server::{
     ExecutionService, ExecutionServiceServer,
@@ -44,6 +45,7 @@ pub struct CoreExecutionService {
     task_destination: String,
     jobs: Arc<RwLock<HashMap<String, JobRecord>>>,
     worker_registry: Arc<dyn WorkerRegistry>,
+    execution_store: Arc<dyn ExecutionStore>,
     #[cfg(test)]
     memory_worker_registry: Option<Arc<MemoryWorkerRegistry>>,
 }
@@ -52,7 +54,6 @@ pub struct CoreExecutionService {
 struct JobRecord {
     job: Job,
     result: Option<JobResult>,
-    execution_id: Option<String>,
 }
 
 impl CoreExecutionService {
@@ -63,8 +64,13 @@ impl CoreExecutionService {
     ) -> Self {
         let registry = Arc::new(MemoryWorkerRegistry::default());
         #[allow(unused_mut)]
-        let mut service =
-            Self::with_worker_registry(broker, result_backend, task_destination, registry.clone());
+        let mut service = Self::with_stores(
+            broker,
+            result_backend,
+            task_destination,
+            registry.clone(),
+            Arc::new(MemoryExecutionStore::default()),
+        );
         #[cfg(test)]
         {
             service.memory_worker_registry = Some(registry);
@@ -72,11 +78,12 @@ impl CoreExecutionService {
         service
     }
 
-    fn with_worker_registry(
+    fn with_stores(
         broker: Arc<dyn Broker>,
         result_backend: Arc<dyn BackendResult<Error = ResultBackendError>>,
         task_destination: impl Into<String>,
         worker_registry: Arc<dyn WorkerRegistry>,
+        execution_store: Arc<dyn ExecutionStore>,
     ) -> Self {
         Self {
             broker,
@@ -84,6 +91,7 @@ impl CoreExecutionService {
             task_destination: task_destination.into(),
             jobs: Arc::new(RwLock::new(HashMap::new())),
             worker_registry,
+            execution_store,
             #[cfg(test)]
             memory_worker_registry: None,
         }
@@ -122,63 +130,6 @@ impl CoreExecutionService {
         record.job.updated_at = Some(SystemTime::now().into());
         record.result = Some(result);
         Ok(())
-    }
-
-    async fn acquire(&self) -> Result<Option<AssignExecutionRequest>, Status> {
-        let submitted = match tokio::time::timeout(
-            Duration::from_secs(30),
-            self.broker.consume(&self.task_destination),
-        )
-        .await
-        {
-            Err(_) => return Ok(None),
-            Ok(result) => result,
-        }
-        .map_err(|error| {
-            tracing::error!(%error, "failed to acquire submitted task");
-            Status::unavailable("task broker is unavailable")
-        })?;
-        let request = SubmitTaskRequest::decode(submitted.payload.as_ref())
-            .map_err(|error| Status::internal(format!("invalid submitted task: {error}")))?;
-        let job_id = submitted
-            .correlation_id
-            .ok_or_else(|| Status::internal("submitted task has no job id"))?;
-        let execution_id = Uuid::new_v4().to_string();
-        let application = request
-            .metadata
-            .as_ref()
-            .and_then(|metadata| metadata.entries.get("application"))
-            .cloned()
-            .unwrap_or_default();
-        let assignment = AssignExecutionRequest {
-            assignment_id: Uuid::new_v4().to_string(),
-            execution_id: execution_id.clone(),
-            job_id: job_id.clone(),
-            task: request.task.clone().or_else(|| {
-                Some(crate::protocols::execution::v1::TaskIdentity {
-                    namespace: request.application_namespace.clone(),
-                    application,
-                    name: request.task_name.clone(),
-                    version: String::new(),
-                })
-            }),
-            arguments: request.arguments,
-            serialization_format: request.serialization_format,
-            reserved_resources: request.resources,
-            deadline: None,
-            metadata: request.metadata,
-        };
-        let mut jobs = self
-            .jobs
-            .write()
-            .map_err(|_| Status::internal("job store lock is poisoned"))?;
-        let record = jobs
-            .get_mut(&job_id)
-            .ok_or_else(|| Status::not_found("job not found"))?;
-        record.execution_id = Some(execution_id);
-        record.job.attempt_number = 1;
-        record.job.updated_at = Some(SystemTime::now().into());
-        Ok(Some(assignment))
     }
 
     async fn accept(&self, request: SubmitTaskRequest) -> Result<SubmitTaskResponse, Status> {
@@ -230,7 +181,6 @@ impl CoreExecutionService {
                 JobRecord {
                     job: job.clone(),
                     result: None,
-                    execution_id: None,
                 },
             );
 
@@ -280,9 +230,9 @@ impl RuntimeService for CoreExecutionService {
         &self,
         _request: Request<AcquireExecutionRequest>,
     ) -> Result<Response<AcquireExecutionResponse>, Status> {
-        Ok(Response::new(AcquireExecutionResponse {
-            assignment: self.acquire().await?,
-        }))
+        Err(Status::unimplemented(
+            "AcquireExecution is obsolete; the scheduler publishes worker assignments",
+        ))
     }
 
     async fn report_execution(
@@ -292,18 +242,22 @@ impl RuntimeService for CoreExecutionService {
         let report = request.into_inner();
         let state = crate::protocols::execution::v1::ExecutionState::try_from(report.state)
             .map_err(|_| Status::invalid_argument("unknown execution state"))?;
-        let job_id = {
-            let jobs = self
-                .jobs
-                .read()
-                .map_err(|_| Status::internal("job store lock is poisoned"))?;
-            jobs.iter()
-                .find(|(_, record)| record.execution_id.as_deref() == Some(&report.execution_id))
-                .map(|(job_id, _)| job_id.clone())
-                .ok_or_else(|| Status::not_found("execution not found"))?
-        };
+        let execution = self.execution_store.get(&report.execution_id).await
+            .map_err(|error| {
+                tracing::error!(%error, execution_id = %report.execution_id, "failed to resolve execution report");
+                Status::unavailable("execution store is unavailable")
+            })?
+            .ok_or_else(|| Status::not_found("execution not found"))?;
+        let job_id = execution.job_id;
+        info!(execution_id = %report.execution_id, %job_id, state = ?state,
+            "execution report resolved");
         match state {
             crate::protocols::execution::v1::ExecutionState::Running => {
+                self.execution_store.update_state(&report.execution_id, state).await
+                    .map_err(|error| {
+                        tracing::error!(%error, execution_id = %report.execution_id, "failed to update execution state");
+                        Status::unavailable("execution store is unavailable")
+                    })?;
                 self.mark_job_running(&job_id)?;
             }
             crate::protocols::execution::v1::ExecutionState::Succeeded
@@ -318,7 +272,9 @@ impl RuntimeService for CoreExecutionService {
                         "failed report requires failure information",
                     ));
                 }
-                outcome.execution_id = report.execution_id;
+                outcome.execution_id = report.execution_id.clone();
+                let serialization_format = outcome.serialization_format.clone();
+                let failure_code = outcome.failure.as_ref().map(|failure| failure.code.clone());
                 self.result_backend
                     .store_result(&job_id, &outcome)
                     .await
@@ -326,7 +282,16 @@ impl RuntimeService for CoreExecutionService {
                         tracing::error!(%error, %job_id, "failed to persist execution result");
                         Status::unavailable("result backend is unavailable")
                     })?;
+                self.execution_store.update_state(&report.execution_id, state).await
+                    .map_err(|error| {
+                        tracing::error!(%error, execution_id = %report.execution_id, "failed to update execution state");
+                        Status::unavailable("execution store is unavailable")
+                    })?;
                 self.store_job_result(&job_id, outcome)?;
+                info!(%job_id, execution_id = %report.execution_id,
+                    assignment_id = %report.assignment_id, state = ?state,
+                    serialization_format, failure_code,
+                    "execution result persisted");
             }
             _ => {
                 return Err(Status::invalid_argument(
@@ -469,14 +434,19 @@ pub async fn serve(
         format!("{}:workers", config.broker.key_prefix),
         Duration::from_secs(config.redis.worker_membership_ttl_seconds),
     )?);
+    let execution_store = Arc::new(RedisExecutionStore::new(
+        &config.redis.url,
+        format!("{}:executions", config.broker.key_prefix),
+    )?);
     let task_destination = config.broker.task_destination.clone();
-    let service = CoreExecutionService::with_worker_registry(
+    let service = CoreExecutionService::with_stores(
         broker.clone(),
         result_backend,
         task_destination.clone(),
         worker_registry.clone(),
+        execution_store.clone(),
     );
-    let scheduler = Scheduler::new(broker, task_destination, worker_registry);
+    let scheduler = Scheduler::new(broker, task_destination, worker_registry, execution_store);
     let listener = TcpListener::bind(&config.server_config()?.bind_address).await?;
     let address = listener.local_addr()?;
     announce_ready(address)?;
@@ -502,6 +472,7 @@ fn announce_ready(address: SocketAddr) -> io::Result<()> {
 mod tests {
     use super::*;
     use crate::broker::BrokerError;
+    use crate::execution_store::ExecutionRecord;
     use crate::protocols::common::v1::Error;
     use crate::protocols::execution::v1::ExecutionState;
     use crate::worker_registry::WorkerDirectory;
@@ -1019,7 +990,9 @@ mod tests {
         assert_eq!(response.result, Some(result));
     }
 
-    async fn acquire_submitted(service: &CoreExecutionService) -> (String, AssignExecutionRequest) {
+    async fn assigned_execution(
+        service: &CoreExecutionService,
+    ) -> (String, AssignExecutionRequest) {
         let job_id = service
             .accept(request(br#"{"args":[1,2]}"#.to_vec()))
             .await
@@ -1027,12 +1000,33 @@ mod tests {
             .job
             .unwrap()
             .job_id;
-        let assignment = service
-            .acquire_execution(Request::new(AcquireExecutionRequest::default()))
+        let assignment = AssignExecutionRequest {
+            assignment_id: Uuid::new_v4().to_string(),
+            execution_id: Uuid::new_v4().to_string(),
+            job_id: job_id.clone(),
+            task: Some(crate::protocols::execution::v1::TaskIdentity {
+                namespace: "development".into(),
+                application: String::new(),
+                name: "demo.add".into(),
+                version: String::new(),
+            }),
+            arguments: br#"{"args":[1,2]}"#.to_vec(),
+            serialization_format: "json".into(),
+            ..Default::default()
+        };
+        let now = SystemTime::now();
+        service
+            .execution_store
+            .create(ExecutionRecord {
+                execution_id: assignment.execution_id.clone(),
+                job_id: job_id.clone(),
+                assignment_id: assignment.assignment_id.clone(),
+                worker_id: "worker-1".into(),
+                state: ExecutionState::Assigned,
+                created_at: now,
+                updated_at: now,
+            })
             .await
-            .unwrap()
-            .into_inner()
-            .assignment
             .unwrap();
         (job_id, assignment)
     }
@@ -1058,19 +1052,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn worker_can_acquire_start_complete_and_observe_success() {
+    async fn assigned_worker_can_start_complete_and_observe_success() {
         let service = CoreExecutionService::new(
             Arc::new(RecordingBroker::default()),
             Arc::new(RecordingResultBackend::default()),
             "tasks",
         );
-        let (job_id, assignment) = acquire_submitted(&service).await;
+        let (job_id, assignment) = assigned_execution(&service).await;
         assert_eq!(assignment.job_id, job_id);
         assert_eq!(assignment.task.as_ref().unwrap().name, "demo.add");
         assert_eq!(assignment.arguments, br#"{"args":[1,2]}"#);
         assert_eq!(assignment.serialization_format, "json");
 
         report(&service, &assignment, ExecutionState::Running, None).await;
+        assert_eq!(
+            service
+                .execution_store
+                .get(&assignment.execution_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            ExecutionState::Running
+        );
         let running = service
             .get_job(Request::new(GetJobRequest {
                 job_id: job_id.clone(),
@@ -1103,16 +1107,26 @@ mod tests {
             completed.result.unwrap().execution_id,
             assignment.execution_id
         );
+        assert_eq!(
+            service
+                .execution_store
+                .get(&assignment.execution_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            ExecutionState::Succeeded
+        );
     }
 
     #[tokio::test]
-    async fn worker_can_acquire_start_fail_and_observe_failure() {
+    async fn assigned_worker_can_start_fail_and_observe_failure() {
         let service = CoreExecutionService::new(
             Arc::new(RecordingBroker::default()),
             Arc::new(RecordingResultBackend::default()),
             "tasks",
         );
-        let (job_id, assignment) = acquire_submitted(&service).await;
+        let (job_id, assignment) = assigned_execution(&service).await;
         report(&service, &assignment, ExecutionState::Running, None).await;
         let failure = Error {
             code: "PYTHON_EXCEPTION".into(),
@@ -1137,5 +1151,36 @@ mod tests {
             .into_inner();
         assert_eq!(failed.job.unwrap().state, i32::from(JobState::Failed));
         assert_eq!(failed.result.unwrap().failure, Some(failure));
+        assert_eq!(
+            service
+                .execution_store
+                .get(&assignment.execution_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            ExecutionState::Failed
+        );
+    }
+
+    #[tokio::test]
+    async fn report_for_unknown_execution_is_not_found() {
+        let service = CoreExecutionService::new(
+            Arc::new(RecordingBroker::default()),
+            Arc::new(RecordingResultBackend::default()),
+            "tasks",
+        );
+
+        let status = service
+            .report_execution(Request::new(ReportExecutionRequest {
+                execution_id: "missing".into(),
+                assignment_id: "assignment".into(),
+                state: ExecutionState::Running.into(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+
+        assert_eq!(status.code(), tonic::Code::NotFound);
     }
 }

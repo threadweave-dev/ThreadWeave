@@ -1,6 +1,9 @@
 use std::io::{self, Write};
+use std::sync::Arc;
 
+use crate::broker::RedisBroker;
 use crate::config::Config;
+use crate::worker::Worker;
 
 const DESCRIPTION: &str = "A language-agnostic, resource-aware distributed execution engine for modern workloads. ThreadWeave orchestrates tasks, scheduling, resources, and observability while letting any language provide its own native runtime through a stable execution protocol.";
 
@@ -24,6 +27,25 @@ pub fn print_banner(config: &Config, component: &str) -> io::Result<()> {
 /// Print the startup information as one JSON object on stdout.
 pub fn print_json(config: &Config, component: &str) -> io::Result<()> {
     print_json_to(config, component, &mut io::stdout().lock())
+}
+
+pub async fn run_server(config: Config) -> Result<(), Box<dyn std::error::Error>> {
+    config.server_config()?;
+    let broker = Arc::new(RedisBroker::new(
+        &config.redis.url,
+        &config.broker.key_prefix,
+    )?);
+    crate::api::serve(config, broker).await
+}
+
+pub async fn run_worker(config: Config) -> Result<(), Box<dyn std::error::Error>> {
+    let worker_config = config.worker_config()?.clone();
+    let broker = Arc::new(RedisBroker::new(
+        &config.redis.url,
+        &config.broker.key_prefix,
+    )?);
+    Worker::new(broker, worker_config).run().await?;
+    Ok(())
 }
 
 fn print_json_to(config: &Config, component: &str, output: &mut impl Write) -> io::Result<()> {

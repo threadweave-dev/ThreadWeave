@@ -453,7 +453,7 @@ pub async fn serve(
         format!("{}:results", config.broker.key_prefix),
     )?);
     let worker_registry = Arc::new(WorkerRegistry::default());
-    let task_destination = config.broker.task_destination;
+    let task_destination = config.broker.task_destination.clone();
     let service = CoreExecutionService::with_worker_registry(
         broker.clone(),
         result_backend,
@@ -461,7 +461,7 @@ pub async fn serve(
         worker_registry.clone(),
     );
     let scheduler = Scheduler::new(broker, task_destination, worker_registry);
-    let listener = TcpListener::bind(&config.server.bind_address).await?;
+    let listener = TcpListener::bind(&config.server_config()?.bind_address).await?;
     let address = listener.local_addr()?;
     announce_ready(address)?;
     let server = tonic::transport::Server::builder()

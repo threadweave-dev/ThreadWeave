@@ -3,7 +3,8 @@ use std::process::{Command, Stdio};
 
 #[test]
 fn announces_the_grpc_endpoint_on_stdout() {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_threadweave-api"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_threadweave"))
+        .arg("server")
         .stdout(Stdio::piped())
         .spawn()
         .expect("failed to run the threadweave binary");
@@ -28,7 +29,8 @@ fn announces_the_grpc_endpoint_on_stdout() {
 
 #[test]
 fn emits_startup_information_as_json_without_using_stderr() {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_threadweave-api"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_threadweave"))
+        .arg("server")
         .arg("--json")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -45,7 +47,7 @@ fn emits_startup_information_as_json_without_using_stderr() {
 
     assert_eq!(startup["type"], "startup");
     assert_eq!(startup["name"], "ThreadWeave");
-    assert_eq!(startup["component"], "api");
+    assert_eq!(startup["component"], "server");
     assert_eq!(startup["broker"]["transport"], "redis");
     assert_eq!(startup["result_backend"]["transport"], "redis");
 

@@ -6,11 +6,10 @@ use serde::Deserialize;
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
-    pub server: ServerConfig,
+    pub server: Option<ServerConfig>,
     pub redis: RedisConfig,
     pub broker: BrokerConfig,
-    #[serde(default)]
-    pub worker: WorkerConfig,
+    pub worker: Option<WorkerConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -32,11 +31,10 @@ pub struct BrokerConfig {
     pub task_destination: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkerConfig {
     pub name: Option<String>,
-    #[serde(default = "default_core_endpoint")]
     pub core_endpoint: String,
     #[serde(default)]
     pub resources: WorkerResourcesConfig,
@@ -44,22 +42,7 @@ pub struct WorkerConfig {
     pub capabilities: Vec<String>,
 }
 
-fn default_core_endpoint() -> String {
-    "http://127.0.0.1:50051".to_owned()
-}
-
-impl Default for WorkerConfig {
-    fn default() -> Self {
-        Self {
-            name: None,
-            core_endpoint: default_core_endpoint(),
-            resources: WorkerResourcesConfig::default(),
-            capabilities: Vec::new(),
-        }
-    }
-}
-
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkerResourcesConfig {
     #[serde(default, deserialize_with = "deserialize_cpu")]
@@ -128,6 +111,18 @@ impl Config {
             .into()
         })
     }
+
+    pub fn server_config(&self) -> Result<&ServerConfig, &'static str> {
+        self.server
+            .as_ref()
+            .ok_or("server configuration is required for the server role")
+    }
+
+    pub fn worker_config(&self) -> Result<&WorkerConfig, &'static str> {
+        self.worker
+            .as_ref()
+            .ok_or("worker configuration is required for the worker role")
+    }
 }
 
 #[cfg(test)]
@@ -149,15 +144,11 @@ broker:
         )
         .unwrap();
 
-        assert_eq!(config.server.bind_address, "127.0.0.1:0");
+        assert_eq!(config.server_config().unwrap().bind_address, "127.0.0.1:0");
         assert_eq!(config.redis.url, "redis://localhost:6379/");
         assert_eq!(config.broker.key_prefix, "test:broker");
         assert_eq!(config.broker.task_destination, "test-tasks");
-        assert!(config.worker.name.is_none());
-        assert_eq!(config.worker.core_endpoint, "http://127.0.0.1:50051");
-        assert_eq!(config.worker.resources.cpu, 0);
-        assert_eq!(config.worker.resources.memory, 0);
-        assert!(config.worker.capabilities.is_empty());
+        assert!(config.worker.is_none());
     }
 
     #[test]
@@ -173,11 +164,15 @@ broker:
   task_destination: test-tasks
 worker:
   name: gpu-worker-01
+  core_endpoint: http://core:50051
 "#,
         )
         .unwrap();
 
-        assert_eq!(config.worker.name.as_deref(), Some("gpu-worker-01"));
+        assert_eq!(
+            config.worker_config().unwrap().name.as_deref(),
+            Some("gpu-worker-01")
+        );
     }
 
     #[test]
@@ -190,6 +185,7 @@ broker:
   key_prefix: test:broker
   task_destination: test-tasks
 worker:
+  core_endpoint: http://core:50051
   resources:
     cpu: 16
     memory: 32GiB
@@ -198,9 +194,10 @@ worker:
         )
         .unwrap();
 
-        assert_eq!(config.worker.resources.cpu, 16);
-        assert_eq!(config.worker.resources.memory, 32 * (1 << 30));
-        assert_eq!(config.worker.capabilities, ["python", "linux"]);
+        let worker = config.worker_config().unwrap();
+        assert_eq!(worker.resources.cpu, 16);
+        assert_eq!(worker.resources.memory, 32 * (1 << 30));
+        assert_eq!(worker.capabilities, ["python", "linux"]);
     }
 
     #[test]
@@ -214,6 +211,7 @@ broker:
   task_destination: test-tasks
 worker:
   resources: { cpu: 4, memory: lots }
+  core_endpoint: http://core:50051
 "#,
         )
         .unwrap_err();
@@ -232,11 +230,12 @@ broker:
   task_destination: test-tasks
 worker:
   capabilities: []
+  core_endpoint: http://core:50051
 "#,
         )
         .unwrap();
 
-        assert!(config.worker.capabilities.is_empty());
+        assert!(config.worker_config().unwrap().capabilities.is_empty());
     }
 
     #[test]
@@ -250,10 +249,42 @@ broker:
   task_destination: test-tasks
 worker:
   resources: { cpu: 18446744073709551615 }
+  core_endpoint: http://core:50051
 "#,
         )
         .unwrap_err();
 
         assert!(error.to_string().contains("millicore range"));
+    }
+
+    #[test]
+    fn server_and_worker_configuration_can_be_loaded_independently() {
+        let server: Config = serde_yaml::from_str(
+            r#"
+server: { bind_address: "0.0.0.0:50051" }
+redis: { url: "redis://redis:6379/" }
+broker: { key_prefix: "threadweave:broker", task_destination: "tasks" }
+"#,
+        )
+        .unwrap();
+        assert!(server.server_config().is_ok());
+        assert!(server.worker_config().is_err());
+
+        let worker: Config = serde_yaml::from_str(
+            r#"
+redis: { url: "redis://redis:6379/" }
+broker: { key_prefix: "threadweave:broker", task_destination: "tasks" }
+worker:
+  core_endpoint: http://server:50051
+  resources: { cpu: 2, memory: 1GiB }
+  capabilities: [linux]
+"#,
+        )
+        .unwrap();
+        assert!(worker.server_config().is_err());
+        assert_eq!(
+            worker.worker_config().unwrap().core_endpoint,
+            "http://server:50051"
+        );
     }
 }

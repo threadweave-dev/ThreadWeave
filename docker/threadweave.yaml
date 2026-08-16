@@ -9,7 +9,7 @@ broker:
   task_destination: tasks
 
 worker:
-  core_endpoint: http://api:50051
+  core_endpoint: http://server:50051
   resources:
     cpu: 1
     memory: 1GiB

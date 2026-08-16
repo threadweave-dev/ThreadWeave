@@ -1,4 +1,4 @@
 #[path = "scheduler.rs"]
 mod implementation;
 
-pub use implementation::Scheduler;
+pub use implementation::{DeferredReason, Scheduler, SchedulingDecision};

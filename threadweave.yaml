@@ -7,4 +7,10 @@ redis:
 broker:
   key_prefix: threadweave:broker
   task_destination: tasks
-  worker_destination: workers.default
+
+worker:
+  core_endpoint: http://127.0.0.1:50051
+  resources:
+    cpu: 1
+    memory: 1GiB
+  capabilities: []

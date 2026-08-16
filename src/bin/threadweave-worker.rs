@@ -36,8 +36,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &config.redis.url,
         &config.broker.key_prefix,
     )?);
-    Worker::new(broker, config.broker.worker_destination)
-        .run()
-        .await?;
+    Worker::new(broker, config.worker).run().await?;
     Ok(())
 }

@@ -15,24 +15,25 @@ services:
     security_opt:
       - no-new-privileges:true
 
-  scheduler:
+  worker:
     image: threadweave:local
-    command: ["/threadweave-scheduler", "--config", "/etc/threadweave/threadweave.yaml"]
+    command: ["/threadweave-worker", "--config", "/etc/threadweave/threadweave.yaml"]
     restart: unless-stopped
     depends_on:
+      core-ready:
+        condition: service_completed_successfully
       redis:
         condition: service_healthy
     read_only: true
     security_opt:
       - no-new-privileges:true
 
-  worker:
-    image: threadweave:local
-    command: ["/threadweave-worker", "--config", "/etc/threadweave/threadweave.yaml"]
-    restart: unless-stopped
+  core-ready:
+    image: busybox:1.37
+    command: ["sh", "-c", "until nc -z api 50051; do sleep 0.1; done"]
     depends_on:
-      redis:
-        condition: service_healthy
+      api:
+        condition: service_started
     read_only: true
     security_opt:
       - no-new-privileges:true

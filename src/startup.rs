@@ -104,7 +104,6 @@ redis:
 broker:
   key_prefix: threadweave:broker
   task_destination: tasks
-  worker_destination: workers.default
 "#
         ))
         .unwrap()

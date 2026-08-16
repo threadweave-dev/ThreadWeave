@@ -1,4 +1,7 @@
 #[path = "worker.rs"]
 mod implementation;
 
-pub use implementation::Worker;
+pub use implementation::{
+    AdvertisedCapacity, Worker, WorkerError, WorkerIdentity, WorkerRegistrationClient,
+    WorkerResources,
+};

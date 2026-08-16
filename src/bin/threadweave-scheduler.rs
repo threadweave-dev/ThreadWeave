@@ -5,6 +5,7 @@ use clap::Parser;
 use threadweave::broker::RedisBroker;
 use threadweave::config::Config;
 use threadweave::scheduler::Scheduler;
+use threadweave::worker_registry::WorkerRegistry;
 
 #[derive(Parser)]
 struct Cli {
@@ -39,7 +40,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Scheduler::new(
         broker,
         config.broker.task_destination,
-        config.broker.worker_destination,
+        Arc::new(WorkerRegistry::default()),
     )
     .run()
     .await?;

@@ -6,3 +6,4 @@ pub mod result_backend;
 pub mod scheduler;
 pub mod startup;
 pub mod worker;
+pub mod worker_registry;

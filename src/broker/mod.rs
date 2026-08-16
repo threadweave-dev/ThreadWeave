@@ -1,4 +1,5 @@
 mod redis;
+mod routing;
 
 use std::fmt;
 
@@ -7,6 +8,7 @@ use async_trait::async_trait;
 use crate::protocols::broker::v1::BrokerEnvelope;
 
 pub use redis::RedisBroker;
+pub use routing::worker_destination;
 
 #[derive(Debug)]
 pub struct BrokerError {

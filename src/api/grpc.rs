@@ -8,7 +8,7 @@ use prost::Message;
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{Request, Response, Status};
-use tracing::info;
+use tracing::{debug, info};
 use uuid::Uuid;
 
 use crate::broker::Broker;
@@ -31,6 +31,8 @@ use crate::protocols::runtime::v1::{
     ReportHeartbeatRequest, ReportHeartbeatResponse,
 };
 use crate::result_backend::{BackendResult, RedisResultBackend, ResultBackendError};
+use crate::scheduler::Scheduler;
+use crate::worker_registry::{HeartbeatError, WorkerRegistry, parse_worker_incarnation_id};
 
 #[derive(Clone)]
 pub struct CoreExecutionService {
@@ -38,6 +40,7 @@ pub struct CoreExecutionService {
     result_backend: Arc<dyn BackendResult<Error = ResultBackendError>>,
     task_destination: String,
     jobs: Arc<RwLock<HashMap<String, JobRecord>>>,
+    worker_registry: Arc<WorkerRegistry>,
 }
 
 #[derive(Clone)]
@@ -53,11 +56,26 @@ impl CoreExecutionService {
         result_backend: Arc<dyn BackendResult<Error = ResultBackendError>>,
         task_destination: impl Into<String>,
     ) -> Self {
+        Self::with_worker_registry(
+            broker,
+            result_backend,
+            task_destination,
+            Arc::new(WorkerRegistry::default()),
+        )
+    }
+
+    fn with_worker_registry(
+        broker: Arc<dyn Broker>,
+        result_backend: Arc<dyn BackendResult<Error = ResultBackendError>>,
+        task_destination: impl Into<String>,
+        worker_registry: Arc<WorkerRegistry>,
+    ) -> Self {
         Self {
             broker,
             result_backend,
             task_destination: task_destination.into(),
             jobs: Arc::new(RwLock::new(HashMap::new())),
+            worker_registry,
         }
     }
 
@@ -165,6 +183,19 @@ impl CoreExecutionService {
 
         let now = prost_types::Timestamp::from(SystemTime::now());
         let job_id = Uuid::new_v4().to_string();
+        let job = Job {
+            job_id: job_id.clone(),
+            application_namespace: request.application_namespace.clone(),
+            task_name: request.task_name.clone(),
+            state: JobState::Accepted.into(),
+            created_at: Some(now),
+            updated_at: Some(now),
+            attempt_number: 0,
+            metadata: request.metadata.clone(),
+            task: request.task.clone(),
+            parent_execution_id: request.parent_execution_id.clone(),
+            root_execution_id: None,
+        };
         let envelope = BrokerEnvelope {
             message_id: Uuid::new_v4().to_string(),
             message_kind: "threadweave_protocols.execution.v1.SubmitTaskRequest".into(),
@@ -181,10 +212,31 @@ impl CoreExecutionService {
             routing_headers: None,
         };
 
-        self.broker.publish(envelope).await.map_err(|error| {
+        self.jobs
+            .write()
+            .map_err(|_| Status::internal("job store lock is poisoned"))?
+            .insert(
+                job_id.clone(),
+                JobRecord {
+                    job: job.clone(),
+                    result: None,
+                    execution_id: None,
+                },
+            );
+
+        if let Err(error) = self.broker.publish(envelope).await {
             tracing::error!(%error, "failed to durably publish task command");
-            Status::unavailable("task broker is unavailable")
-        })?;
+            match self.jobs.write() {
+                Ok(mut jobs) => {
+                    jobs.remove(&job_id);
+                }
+                Err(poisoned) => {
+                    tracing::error!(%job_id, "job store lock is poisoned during publish rollback");
+                    poisoned.into_inner().remove(&job_id);
+                }
+            }
+            return Err(Status::unavailable("task broker is unavailable"));
+        }
 
         let command_result = CommandResult {
             status: CommandStatus::Accepted.into(),
@@ -204,31 +256,6 @@ impl CoreExecutionService {
                 tracing::error!(%error, %job_id, "failed to store task result");
                 Status::unavailable("result backend is unavailable")
             })?;
-
-        let job = Job {
-            job_id: job_id.clone(),
-            application_namespace: request.application_namespace.clone(),
-            task_name: request.task_name.clone(),
-            state: JobState::Accepted.into(),
-            created_at: Some(now),
-            updated_at: Some(now),
-            attempt_number: 0,
-            metadata: request.metadata.clone(),
-            task: request.task.clone(),
-            parent_execution_id: request.parent_execution_id.clone(),
-            root_execution_id: None,
-        };
-        self.jobs
-            .write()
-            .map_err(|_| Status::internal("job store lock is poisoned"))?
-            .insert(
-                job_id,
-                JobRecord {
-                    job: job.clone(),
-                    result: None,
-                    execution_id: None,
-                },
-            );
 
         Ok(SubmitTaskResponse {
             job: Some(job),
@@ -308,15 +335,55 @@ impl RuntimeService for CoreExecutionService {
     }
     async fn report_heartbeat(
         &self,
-        _: Request<ReportHeartbeatRequest>,
+        request: Request<ReportHeartbeatRequest>,
     ) -> Result<Response<ReportHeartbeatResponse>, Status> {
-        Err(Status::unimplemented("ReportHeartbeat is outside this POC"))
+        let heartbeat = request
+            .into_inner()
+            .heartbeat
+            .ok_or_else(|| Status::invalid_argument("heartbeat is required"))?;
+        let (worker_id, generation) = parse_worker_incarnation_id(&heartbeat.runtime_id)
+            .ok_or_else(|| {
+                Status::invalid_argument("heartbeat runtime_id must identify a worker generation")
+            })?;
+        self.worker_registry
+            .heartbeat(worker_id, generation)
+            .map_err(|error| match error {
+                HeartbeatError::UnknownWorker => Status::not_found("worker is not registered"),
+                HeartbeatError::StaleGeneration => {
+                    Status::failed_precondition("worker generation is stale")
+                }
+                HeartbeatError::RegistryUnavailable => {
+                    Status::internal("worker registry lock is poisoned")
+                }
+            })?;
+        debug!(%worker_id, %generation, sequence_number = heartbeat.sequence_number,
+            "worker heartbeat accepted");
+        Ok(Response::new(ReportHeartbeatResponse { accepted: true }))
     }
     async fn register_worker(
         &self,
-        _: Request<RegisterWorkerRequest>,
+        request: Request<RegisterWorkerRequest>,
     ) -> Result<Response<RegisterWorkerResponse>, Status> {
-        Err(Status::unimplemented("RegisterWorker is outside this POC"))
+        let registration = request
+            .into_inner()
+            .registration
+            .ok_or_else(|| Status::invalid_argument("registration is required"))?;
+        if registration.worker_id.trim().is_empty() {
+            return Err(Status::invalid_argument("worker_id is required"));
+        }
+        if registration.generation.trim().is_empty() {
+            return Err(Status::invalid_argument("generation is required"));
+        }
+        let outcome = self
+            .worker_registry
+            .register(registration.clone())
+            .map_err(Status::internal)?;
+        info!(worker_id = %registration.worker_id, generation = %registration.generation,
+            ?outcome, "registered worker");
+        Ok(Response::new(RegisterWorkerResponse {
+            accepted: true,
+            lease_id: None,
+        }))
     }
     async fn assign_execution(
         &self,
@@ -385,15 +452,26 @@ pub async fn serve(
         &config.redis.url,
         format!("{}:results", config.broker.key_prefix),
     )?);
-    let service = CoreExecutionService::new(broker, result_backend, config.broker.task_destination);
+    let worker_registry = Arc::new(WorkerRegistry::default());
+    let task_destination = config.broker.task_destination;
+    let service = CoreExecutionService::with_worker_registry(
+        broker.clone(),
+        result_backend,
+        task_destination.clone(),
+        worker_registry.clone(),
+    );
+    let scheduler = Scheduler::new(broker, task_destination, worker_registry);
     let listener = TcpListener::bind(&config.server.bind_address).await?;
     let address = listener.local_addr()?;
     announce_ready(address)?;
-    tonic::transport::Server::builder()
+    let server = tonic::transport::Server::builder()
         .add_service(ExecutionServiceServer::new(service.clone()))
         .add_service(RuntimeServiceServer::new(service))
-        .serve_with_incoming(TcpListenerStream::new(listener))
-        .await?;
+        .serve_with_incoming(TcpListenerStream::new(listener));
+    tokio::select! {
+        result = scheduler.run() => result?,
+        result = server => result?,
+    }
     Ok(())
 }
 
@@ -411,6 +489,29 @@ mod tests {
     use crate::protocols::common::v1::Error;
     use crate::protocols::execution::v1::ExecutionState;
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    fn heartbeat(worker_id: &str, generation: &str) -> ReportHeartbeatRequest {
+        ReportHeartbeatRequest {
+            heartbeat: Some(crate::protocols::runtime::v1::RuntimeHeartbeat {
+                runtime_id: crate::worker_registry::worker_incarnation_id(worker_id, generation),
+                sequence_number: 1,
+                ..Default::default()
+            }),
+        }
+    }
+
+    fn worker_registration(worker_id: &str, generation: &str) -> RegisterWorkerRequest {
+        RegisterWorkerRequest {
+            registration: Some(crate::protocols::runtime::v1::WorkerRegistration {
+                worker_id: worker_id.to_owned(),
+                generation: generation.to_owned(),
+                implementation_version: "test".to_owned(),
+                protocol_versions: vec!["runtime/v1".to_owned()],
+                ..Default::default()
+            }),
+        }
+    }
 
     #[derive(Default)]
     struct RecordingBroker {
@@ -420,6 +521,13 @@ mod tests {
     struct RecordingResultBackend {
         results: Mutex<Vec<(String, JobResult)>>,
     }
+    #[derive(Default)]
+    struct InspectingBroker {
+        jobs: Mutex<Option<JobStore>>,
+        job_was_visible: AtomicBool,
+        fail_publish: bool,
+    }
+    type JobStore = Arc<RwLock<HashMap<String, JobRecord>>>;
     #[tonic::async_trait]
     impl BackendResult for RecordingResultBackend {
         type Error = ResultBackendError;
@@ -445,6 +553,211 @@ mod tests {
             }
             Ok(envelopes.remove(0))
         }
+    }
+    #[tonic::async_trait]
+    impl Broker for InspectingBroker {
+        async fn publish(&self, envelope: BrokerEnvelope) -> Result<(), BrokerError> {
+            let job_id = envelope.correlation_id.unwrap();
+            let jobs = self.jobs.lock().unwrap();
+            self.job_was_visible.store(
+                jobs.as_ref().unwrap().read().unwrap().contains_key(&job_id),
+                Ordering::SeqCst,
+            );
+            if self.fail_publish {
+                return Err(BrokerError::new("publish failed"));
+            }
+            Ok(())
+        }
+        async fn consume(&self, _: &str) -> Result<BrokerEnvelope, BrokerError> {
+            Err(BrokerError::new("empty"))
+        }
+    }
+
+    #[tokio::test]
+    async fn valid_worker_registration_is_acknowledged_and_recorded() {
+        let service = CoreExecutionService::new(
+            Arc::new(RecordingBroker::default()),
+            Arc::new(RecordingResultBackend::default()),
+            "tasks",
+        );
+
+        let response = service
+            .register_worker(Request::new(worker_registration(
+                "worker-1",
+                "generation-1",
+            )))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert!(response.accepted);
+        assert!(response.lease_id.is_none());
+        assert_eq!(service.worker_registry.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn malformed_worker_registration_is_rejected() {
+        let service = CoreExecutionService::new(
+            Arc::new(RecordingBroker::default()),
+            Arc::new(RecordingResultBackend::default()),
+            "tasks",
+        );
+
+        let status = service
+            .register_worker(Request::new(worker_registration(" ", "generation-1")))
+            .await
+            .unwrap_err();
+
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert_eq!(service.worker_registry.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn same_worker_generation_registration_is_idempotent() {
+        let service = CoreExecutionService::new(
+            Arc::new(RecordingBroker::default()),
+            Arc::new(RecordingResultBackend::default()),
+            "tasks",
+        );
+        let request = worker_registration("worker-1", "generation-1");
+
+        service
+            .register_worker(Request::new(request.clone()))
+            .await
+            .unwrap();
+        let mut duplicate = request;
+        duplicate
+            .registration
+            .as_mut()
+            .unwrap()
+            .implementation_version = "changed-but-same-incarnation".to_owned();
+        service
+            .register_worker(Request::new(duplicate))
+            .await
+            .unwrap();
+
+        assert_eq!(service.worker_registry.len(), 1);
+        let stored = service.worker_registry.get("worker-1").unwrap();
+        assert_eq!(stored.registration.generation, "generation-1");
+        assert_eq!(stored.registration.implementation_version, "test");
+    }
+
+    #[tokio::test]
+    async fn new_generation_replaces_previous_worker_incarnation() {
+        let service = CoreExecutionService::new(
+            Arc::new(RecordingBroker::default()),
+            Arc::new(RecordingResultBackend::default()),
+            "tasks",
+        );
+
+        service
+            .register_worker(Request::new(worker_registration(
+                "worker-1",
+                "generation-1",
+            )))
+            .await
+            .unwrap();
+        service
+            .register_worker(Request::new(worker_registration(
+                "worker-1",
+                "generation-2",
+            )))
+            .await
+            .unwrap();
+
+        assert_eq!(service.worker_registry.len(), 1);
+        assert_eq!(
+            service
+                .worker_registry
+                .get("worker-1")
+                .unwrap()
+                .registration
+                .generation,
+            "generation-2"
+        );
+    }
+
+    #[tokio::test]
+    async fn heartbeat_for_current_generation_is_accepted_and_updates_last_seen() {
+        let service = CoreExecutionService::new(
+            Arc::new(RecordingBroker::default()),
+            Arc::new(RecordingResultBackend::default()),
+            "tasks",
+        );
+        service
+            .register_worker(Request::new(worker_registration(
+                "worker-1",
+                "generation-1",
+            )))
+            .await
+            .unwrap();
+        let registered_at = service
+            .worker_registry
+            .get("worker-1")
+            .unwrap()
+            .registered_at;
+
+        let response = service
+            .report_heartbeat(Request::new(heartbeat("worker-1", "generation-1")))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert!(response.accepted);
+        let last_seen = service
+            .worker_registry
+            .get("worker-1")
+            .unwrap()
+            .last_heartbeat_at
+            .unwrap();
+        assert!(last_seen >= registered_at);
+    }
+
+    #[tokio::test]
+    async fn heartbeat_for_unknown_worker_is_rejected() {
+        let service = CoreExecutionService::new(
+            Arc::new(RecordingBroker::default()),
+            Arc::new(RecordingResultBackend::default()),
+            "tasks",
+        );
+
+        let status = service
+            .report_heartbeat(Request::new(heartbeat("unknown", "generation-1")))
+            .await
+            .unwrap_err();
+
+        assert_eq!(status.code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn heartbeat_for_stale_generation_is_rejected() {
+        let service = CoreExecutionService::new(
+            Arc::new(RecordingBroker::default()),
+            Arc::new(RecordingResultBackend::default()),
+            "tasks",
+        );
+        service
+            .register_worker(Request::new(worker_registration(
+                "worker-1",
+                "generation-2",
+            )))
+            .await
+            .unwrap();
+
+        let status = service
+            .report_heartbeat(Request::new(heartbeat("worker-1", "generation-1")))
+            .await
+            .unwrap_err();
+
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            service
+                .worker_registry
+                .get("worker-1")
+                .unwrap()
+                .last_heartbeat_at
+                .is_none()
+        );
     }
     fn request(payload: Vec<u8>) -> SubmitTaskRequest {
         SubmitTaskRequest {
@@ -485,6 +798,41 @@ mod tests {
         let results = result_backend.results.lock().unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, job.job_id);
+    }
+
+    #[tokio::test]
+    async fn job_is_visible_before_task_is_published() {
+        let broker = Arc::new(InspectingBroker::default());
+        let service = CoreExecutionService::new(
+            broker.clone(),
+            Arc::new(RecordingResultBackend::default()),
+            "tasks",
+        );
+        *broker.jobs.lock().unwrap() = Some(service.jobs.clone());
+
+        service.accept(request(Vec::new())).await.unwrap();
+
+        assert!(broker.job_was_visible.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn failed_publish_removes_inserted_job() {
+        let broker = Arc::new(InspectingBroker {
+            fail_publish: true,
+            ..Default::default()
+        });
+        let service = CoreExecutionService::new(
+            broker.clone(),
+            Arc::new(RecordingResultBackend::default()),
+            "tasks",
+        );
+        *broker.jobs.lock().unwrap() = Some(service.jobs.clone());
+
+        let status = service.accept(request(Vec::new())).await.unwrap_err();
+
+        assert_eq!(status.code(), tonic::Code::Unavailable);
+        assert!(broker.job_was_visible.load(Ordering::SeqCst));
+        assert!(service.jobs.read().unwrap().is_empty());
     }
     #[tokio::test]
     async fn empty_payload_is_accepted() {

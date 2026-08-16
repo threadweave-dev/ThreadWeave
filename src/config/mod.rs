@@ -22,6 +22,12 @@ pub struct ServerConfig {
 #[serde(deny_unknown_fields)]
 pub struct RedisConfig {
     pub url: String,
+    #[serde(default = "default_worker_membership_ttl_seconds")]
+    pub worker_membership_ttl_seconds: u64,
+}
+
+fn default_worker_membership_ttl_seconds() -> u64 {
+    30
 }
 
 #[derive(Debug, Deserialize)]
@@ -146,9 +152,25 @@ broker:
 
         assert_eq!(config.server_config().unwrap().bind_address, "127.0.0.1:0");
         assert_eq!(config.redis.url, "redis://localhost:6379/");
+        assert_eq!(config.redis.worker_membership_ttl_seconds, 30);
         assert_eq!(config.broker.key_prefix, "test:broker");
         assert_eq!(config.broker.task_destination, "test-tasks");
         assert!(config.worker.is_none());
+    }
+
+    #[test]
+    fn parses_worker_membership_ttl() {
+        let config: Config = serde_yaml::from_str(
+            r#"
+redis:
+  url: redis://localhost:6379/
+  worker_membership_ttl_seconds: 45
+broker: { key_prefix: "test:broker", task_destination: "tasks" }
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.redis.worker_membership_ttl_seconds, 45);
     }
 
     #[test]

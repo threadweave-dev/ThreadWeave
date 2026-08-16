@@ -32,7 +32,10 @@ use crate::protocols::runtime::v1::{
 };
 use crate::result_backend::{BackendResult, RedisResultBackend, ResultBackendError};
 use crate::scheduler::Scheduler;
-use crate::worker_registry::{HeartbeatError, WorkerRegistry, parse_worker_incarnation_id};
+use crate::worker_registry::{
+    HeartbeatError, MemoryWorkerRegistry, RedisWorkerRegistry, WorkerRegistry,
+    parse_worker_incarnation_id,
+};
 
 #[derive(Clone)]
 pub struct CoreExecutionService {
@@ -40,7 +43,9 @@ pub struct CoreExecutionService {
     result_backend: Arc<dyn BackendResult<Error = ResultBackendError>>,
     task_destination: String,
     jobs: Arc<RwLock<HashMap<String, JobRecord>>>,
-    worker_registry: Arc<WorkerRegistry>,
+    worker_registry: Arc<dyn WorkerRegistry>,
+    #[cfg(test)]
+    memory_worker_registry: Option<Arc<MemoryWorkerRegistry>>,
 }
 
 #[derive(Clone)]
@@ -56,19 +61,22 @@ impl CoreExecutionService {
         result_backend: Arc<dyn BackendResult<Error = ResultBackendError>>,
         task_destination: impl Into<String>,
     ) -> Self {
-        Self::with_worker_registry(
-            broker,
-            result_backend,
-            task_destination,
-            Arc::new(WorkerRegistry::default()),
-        )
+        let registry = Arc::new(MemoryWorkerRegistry::default());
+        #[allow(unused_mut)]
+        let mut service =
+            Self::with_worker_registry(broker, result_backend, task_destination, registry.clone());
+        #[cfg(test)]
+        {
+            service.memory_worker_registry = Some(registry);
+        }
+        service
     }
 
     fn with_worker_registry(
         broker: Arc<dyn Broker>,
         result_backend: Arc<dyn BackendResult<Error = ResultBackendError>>,
         task_destination: impl Into<String>,
-        worker_registry: Arc<WorkerRegistry>,
+        worker_registry: Arc<dyn WorkerRegistry>,
     ) -> Self {
         Self {
             broker,
@@ -76,6 +84,8 @@ impl CoreExecutionService {
             task_destination: task_destination.into(),
             jobs: Arc::new(RwLock::new(HashMap::new())),
             worker_registry,
+            #[cfg(test)]
+            memory_worker_registry: None,
         }
     }
 
@@ -347,13 +357,14 @@ impl RuntimeService for CoreExecutionService {
             })?;
         self.worker_registry
             .heartbeat(worker_id, generation)
+            .await
             .map_err(|error| match error {
                 HeartbeatError::UnknownWorker => Status::not_found("worker is not registered"),
                 HeartbeatError::StaleGeneration => {
                     Status::failed_precondition("worker generation is stale")
                 }
                 HeartbeatError::RegistryUnavailable => {
-                    Status::internal("worker registry lock is poisoned")
+                    Status::unavailable("worker registry is unavailable")
                 }
             })?;
         debug!(%worker_id, %generation, sequence_number = heartbeat.sequence_number,
@@ -377,7 +388,8 @@ impl RuntimeService for CoreExecutionService {
         let outcome = self
             .worker_registry
             .register(registration.clone())
-            .map_err(Status::internal)?;
+            .await
+            .map_err(|error| Status::internal(error.to_string()))?;
         info!(worker_id = %registration.worker_id, generation = %registration.generation,
             ?outcome, "registered worker");
         Ok(Response::new(RegisterWorkerResponse {
@@ -452,7 +464,11 @@ pub async fn serve(
         &config.redis.url,
         format!("{}:results", config.broker.key_prefix),
     )?);
-    let worker_registry = Arc::new(WorkerRegistry::default());
+    let worker_registry = Arc::new(RedisWorkerRegistry::new(
+        &config.redis.url,
+        format!("{}:workers", config.broker.key_prefix),
+        Duration::from_secs(config.redis.worker_membership_ttl_seconds),
+    )?);
     let task_destination = config.broker.task_destination.clone();
     let service = CoreExecutionService::with_worker_registry(
         broker.clone(),
@@ -488,6 +504,7 @@ mod tests {
     use crate::broker::BrokerError;
     use crate::protocols::common::v1::Error;
     use crate::protocols::execution::v1::ExecutionState;
+    use crate::worker_registry::WorkerDirectory;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -592,7 +609,17 @@ mod tests {
 
         assert!(response.accepted);
         assert!(response.lease_id.is_none());
-        assert_eq!(service.worker_registry.len(), 1);
+        assert_eq!(
+            service
+                .memory_worker_registry
+                .as_ref()
+                .unwrap()
+                .available_workers()
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -609,7 +636,16 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(status.code(), tonic::Code::InvalidArgument);
-        assert_eq!(service.worker_registry.len(), 0);
+        assert!(
+            service
+                .memory_worker_registry
+                .as_ref()
+                .unwrap()
+                .available_workers()
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -636,8 +672,23 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(service.worker_registry.len(), 1);
-        let stored = service.worker_registry.get("worker-1").unwrap();
+        assert_eq!(
+            service
+                .memory_worker_registry
+                .as_ref()
+                .unwrap()
+                .available_workers()
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        let stored = service
+            .memory_worker_registry
+            .as_ref()
+            .unwrap()
+            .get("worker-1")
+            .unwrap();
         assert_eq!(stored.registration.generation, "generation-1");
         assert_eq!(stored.registration.implementation_version, "test");
     }
@@ -665,10 +716,22 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(service.worker_registry.len(), 1);
         assert_eq!(
             service
-                .worker_registry
+                .memory_worker_registry
+                .as_ref()
+                .unwrap()
+                .available_workers()
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            service
+                .memory_worker_registry
+                .as_ref()
+                .unwrap()
                 .get("worker-1")
                 .unwrap()
                 .registration
@@ -692,7 +755,9 @@ mod tests {
             .await
             .unwrap();
         let registered_at = service
-            .worker_registry
+            .memory_worker_registry
+            .as_ref()
+            .unwrap()
             .get("worker-1")
             .unwrap()
             .registered_at;
@@ -705,7 +770,9 @@ mod tests {
 
         assert!(response.accepted);
         let last_seen = service
-            .worker_registry
+            .memory_worker_registry
+            .as_ref()
+            .unwrap()
             .get("worker-1")
             .unwrap()
             .last_heartbeat_at
@@ -752,7 +819,9 @@ mod tests {
         assert_eq!(status.code(), tonic::Code::FailedPrecondition);
         assert!(
             service
-                .worker_registry
+                .memory_worker_registry
+                .as_ref()
+                .unwrap()
                 .get("worker-1")
                 .unwrap()
                 .last_heartbeat_at

@@ -62,6 +62,7 @@ impl Scheduler {
         let worker_id = match self
             .worker_directory
             .available_workers()
+            .await
             .map_err(|_| BrokerError::new("worker directory is unavailable"))?
             .into_iter()
             .next()
@@ -134,8 +135,9 @@ mod tests {
 
     struct TestWorkerDirectory(Vec<String>);
 
+    #[async_trait::async_trait]
     impl WorkerDirectory for TestWorkerDirectory {
-        fn available_workers(&self) -> Result<Vec<String>, WorkerDirectoryError> {
+        async fn available_workers(&self) -> Result<Vec<String>, WorkerDirectoryError> {
             let mut workers = self.0.clone();
             workers.sort();
             Ok(workers)

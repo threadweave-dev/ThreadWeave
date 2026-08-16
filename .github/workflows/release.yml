@@ -48,9 +48,7 @@ jobs:
           mkdir -p dist
           tar -C "target/${{ matrix.target }}/release" \
             -czf "dist/${{ matrix.archive }}" \
-            threadweave-api \
-            threadweave-scheduler \
-            threadweave-worker
+            threadweave
 
       - name: Package the Windows binary
         if: runner.os == 'Windows'
@@ -58,10 +56,7 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force dist
           Compress-Archive `
-            -Path `
-              "target/${{ matrix.target }}/release/threadweave-api.exe", `
-              "target/${{ matrix.target }}/release/threadweave-scheduler.exe", `
-              "target/${{ matrix.target }}/release/threadweave-worker.exe" `
+            -Path "target/${{ matrix.target }}/release/threadweave.exe" `
             -DestinationPath "dist/${{ matrix.archive }}"
 
       - name: Store the release artifact

@@ -27,6 +27,8 @@ services:
     read_only: true
     security_opt:
       - no-new-privileges:true
+    ports:
+      - "127.0.0.1:${THREADWEAVE_WORKER_RUNTIME_PORT:-50052}:50052"
 
   core-ready:
     image: busybox:1.37

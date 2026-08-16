@@ -7,13 +7,24 @@ use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 use prost::Message;
+#[cfg(not(test))]
+use tokio::net::TcpListener;
+#[cfg(not(test))]
+use tokio_stream::wrappers::TcpListenerStream;
+#[cfg(not(test))]
+use tonic::transport::Server;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+use super::PendingExecutions;
+#[cfg(not(test))]
+use super::WorkerRuntimeService;
 use crate::broker::{Broker, BrokerError, worker_destination};
 use crate::config::WorkerConfig;
 use crate::protocols::common::v1::{Metadata, ResourceRequirements};
 use crate::protocols::runtime::v1::runtime_service_client::RuntimeServiceClient;
+#[cfg(not(test))]
+use crate::protocols::runtime::v1::runtime_service_server::RuntimeServiceServer;
 use crate::protocols::runtime::v1::{
     AssignExecutionRequest, RegisterWorkerRequest, RegisterWorkerResponse, ReportHeartbeatRequest,
     ReportHeartbeatResponse, RuntimeHeartbeat, RuntimeStatus, WorkerRegistration,
@@ -154,6 +165,8 @@ pub struct Worker {
     advertised_capacity: AdvertisedCapacity,
     registration_client: Arc<dyn WorkerRegistrationClient>,
     heartbeat_interval: Duration,
+    runtime_address: String,
+    pending_executions: PendingExecutions,
 }
 
 impl Worker {
@@ -175,6 +188,8 @@ impl Worker {
             },
             registration_client,
             heartbeat_interval: HEARTBEAT_INTERVAL,
+            runtime_address: config.runtime_address,
+            pending_executions: PendingExecutions::default(),
         }
     }
 
@@ -197,6 +212,8 @@ impl Worker {
             },
             registration_client,
             heartbeat_interval: HEARTBEAT_INTERVAL,
+            runtime_address: config.runtime_address,
+            pending_executions: PendingExecutions::default(),
         }
     }
 
@@ -218,8 +235,7 @@ impl Worker {
                 .into_iter()
                 .map(str::to_owned)
                 .collect(),
-            // This pull-based POC does not expose a Worker RPC endpoint.
-            endpoint: String::new(),
+            endpoint: self.runtime_address.clone(),
             executors: Vec::new(),
             capacity: Some(ResourceRequirements {
                 required_capabilities: self.advertised_capacity.capabilities.clone(),
@@ -277,6 +293,33 @@ impl Worker {
         let assignments = self.assignment_loop();
         let heartbeats = self.heartbeat_loop();
         tokio::pin!(assignments, heartbeats);
+        #[cfg(not(test))]
+        let runtime_server = async {
+            let listener = TcpListener::bind(&self.runtime_address)
+                .await
+                .map_err(|error| WorkerError(format!("cannot bind worker runtime API: {error}")))?;
+            let address = listener.local_addr().map_err(|error| {
+                WorkerError(format!("cannot inspect worker runtime API: {error}"))
+            })?;
+            info!(%address, "worker runtime gRPC API listening");
+            Server::builder()
+                .add_service(RuntimeServiceServer::new(WorkerRuntimeService::new(
+                    self.pending_executions.clone(),
+                )))
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await
+                .map_err(|error| WorkerError(format!("worker runtime API failed: {error}")))
+        };
+        #[cfg(not(test))]
+        tokio::pin!(runtime_server);
+        #[cfg(not(test))]
+        let result = tokio::select! {
+            result = &mut assignments => result,
+            _ = &mut heartbeats => unreachable!("heartbeat loop does not complete"),
+            result = &mut runtime_server => result,
+            _ = &mut shutdown => Ok(()),
+        };
+        #[cfg(test)]
         let result = tokio::select! {
             result = &mut assignments => result,
             _ = &mut heartbeats => unreachable!("heartbeat loop does not complete"),
@@ -333,14 +376,17 @@ impl Worker {
             AssignExecutionRequest::decode(envelope.payload.as_ref()).map_err(|error| {
                 BrokerError::new(format!("invalid AssignExecutionRequest: {error}"))
             })?;
+        self.pending_executions
+            .enqueue(assignment.clone())
+            .await
+            .map_err(|error| BrokerError::new(format!("cannot queue assignment: {error}")))?;
         let task_name = assignment
             .task
             .as_ref()
             .map(|task| task.name.as_str())
             .unwrap_or("<unspecified>");
         info!(execution_id = %assignment.execution_id, "received execution");
-        info!(task = task_name, "executing task");
-        info!(execution_id = %assignment.execution_id, "execution completed");
+        info!(task = task_name, "queued execution for attached runtime");
         Ok(assignment)
     }
 }
@@ -384,6 +430,7 @@ mod tests {
     #[tokio::test]
     async fn assignment_reaches_no_op_execution_path() {
         let assignment = AssignExecutionRequest {
+            assignment_id: "assignment-1".into(),
             execution_id: "execution-1".into(),
             task: Some(TaskIdentity {
                 name: "demo.add".into(),
@@ -395,12 +442,12 @@ mod tests {
             payload: assignment.encode_to_vec(),
             ..Default::default()
         }))));
-        let executed = Worker::new(broker, WorkerConfig::default())
-            .execute_one()
-            .await
-            .unwrap();
-        assert_eq!(executed.execution_id, "execution-1");
-        assert_eq!(executed.task.unwrap().name, "demo.add");
+        let executed = Worker::new(broker, WorkerConfig::default());
+        let consumed = executed.execute_one().await.unwrap();
+        let acquired = executed.pending_executions.acquire().await;
+        assert_eq!(consumed, acquired);
+        assert_eq!(acquired.execution_id, "execution-1");
+        assert_eq!(acquired.task.unwrap().name, "demo.add");
     }
 
     #[derive(Default)]
@@ -415,7 +462,12 @@ mod tests {
         async fn consume(&self, destination: &str) -> Result<BrokerEnvelope, BrokerError> {
             self.0.lock().unwrap().push(destination.to_owned());
             Ok(BrokerEnvelope {
-                payload: AssignExecutionRequest::default().encode_to_vec(),
+                payload: AssignExecutionRequest {
+                    assignment_id: "assignment-1".into(),
+                    execution_id: "execution-1".into(),
+                    ..Default::default()
+                }
+                .encode_to_vec(),
                 ..Default::default()
             })
         }
@@ -484,6 +536,7 @@ mod tests {
             WorkerConfig {
                 name: Some("big-bertha".to_owned()),
                 core_endpoint: "http://core.invalid".to_owned(),
+                runtime_address: "127.0.0.1:0".to_owned(),
                 resources: crate::config::WorkerResourcesConfig {
                     cpu: 16,
                     memory: 32 * (1 << 30),
@@ -614,6 +667,7 @@ mod tests {
             WorkerConfig {
                 name: Some("gpu-01".to_owned()),
                 core_endpoint: "http://core.invalid".to_owned(),
+                runtime_address: "127.0.0.1:0".to_owned(),
                 resources: crate::config::WorkerResourcesConfig {
                     cpu: 8,
                     memory: 16 * (1 << 30),
@@ -640,7 +694,7 @@ mod tests {
                 "runtime/v1"
             ]
         );
-        assert!(registration.endpoint.is_empty());
+        assert_eq!(registration.endpoint, "127.0.0.1:0");
         assert_eq!(
             registration.capacity.unwrap().required_capabilities,
             ["cuda"]

@@ -37,15 +37,33 @@ pub struct BrokerConfig {
     pub task_destination: String,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkerConfig {
     pub name: Option<String>,
     pub core_endpoint: String,
+    #[serde(default = "default_worker_runtime_address")]
+    pub runtime_address: String,
     #[serde(default)]
     pub resources: WorkerResourcesConfig,
     #[serde(default)]
     pub capabilities: Vec<String>,
+}
+
+impl Default for WorkerConfig {
+    fn default() -> Self {
+        Self {
+            name: None,
+            core_endpoint: String::new(),
+            runtime_address: default_worker_runtime_address(),
+            resources: WorkerResourcesConfig::default(),
+            capabilities: Vec::new(),
+        }
+    }
+}
+
+fn default_worker_runtime_address() -> String {
+    "0.0.0.0:50052".to_owned()
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -194,6 +212,10 @@ worker:
         assert_eq!(
             config.worker_config().unwrap().name.as_deref(),
             Some("gpu-worker-01")
+        );
+        assert_eq!(
+            config.worker_config().unwrap().runtime_address,
+            "0.0.0.0:50052"
         );
     }
 

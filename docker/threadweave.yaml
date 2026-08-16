@@ -10,6 +10,7 @@ broker:
 
 worker:
   core_endpoint: http://server:50051
+  runtime_address: 0.0.0.0:50052
   resources:
     cpu: 1
     memory: 1GiB

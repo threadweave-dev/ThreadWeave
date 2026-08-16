@@ -400,17 +400,29 @@ impl Worker {
             AssignExecutionRequest::decode(envelope.payload.as_ref()).map_err(|error| {
                 BrokerError::new(format!("invalid AssignExecutionRequest: {error}"))
             })?;
-        self.pending_executions
-            .enqueue(assignment.clone())
-            .await
-            .map_err(|error| BrokerError::new(format!("cannot queue assignment: {error}")))?;
         let task_name = assignment
             .task
             .as_ref()
             .map(|task| task.name.as_str())
             .unwrap_or("<unspecified>");
-        info!(execution_id = %assignment.execution_id, "received execution");
-        info!(task = task_name, "queued execution for attached runtime");
+        info!(
+            job_id = %assignment.job_id,
+            execution_id = %assignment.execution_id,
+            assignment_id = %assignment.assignment_id,
+            task = task_name,
+            "execution received from broker"
+        );
+        self.pending_executions
+            .enqueue(assignment.clone())
+            .await
+            .map_err(|error| BrokerError::new(format!("cannot queue assignment: {error}")))?;
+        info!(
+            job_id = %assignment.job_id,
+            execution_id = %assignment.execution_id,
+            assignment_id = %assignment.assignment_id,
+            task = task_name,
+            "execution queued for runtime"
+        );
         Ok(assignment)
     }
 }

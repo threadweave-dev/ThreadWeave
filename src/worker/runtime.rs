@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use tokio::sync::{Mutex, Notify};
 use tonic::{Request, Response, Status};
+use tracing::{error, info, warn};
 
 use super::CoreWorkerClient;
 use crate::protocols::execution::v1::ExecutionState;
@@ -88,7 +89,10 @@ impl PendingExecutions {
         }
     }
 
-    pub async fn report(&self, report: ReportExecutionRequest) -> Result<(), Status> {
+    pub async fn report(
+        &self,
+        report: ReportExecutionRequest,
+    ) -> Result<AssignExecutionRequest, Status> {
         let reported_state = ExecutionState::try_from(report.state)
             .map_err(|_| Status::invalid_argument("unknown execution state"))?;
         let mut state = self.state.lock().await;
@@ -146,7 +150,7 @@ impl PendingExecutions {
             }
         };
         record.last_sequence_number = Some(report.sequence_number);
-        Ok(())
+        Ok(record.assignment.clone())
     }
 }
 
@@ -171,8 +175,16 @@ impl RuntimeService for WorkerRuntimeService {
         &self,
         _request: Request<AcquireExecutionRequest>,
     ) -> Result<Response<AcquireExecutionResponse>, Status> {
+        let assignment = self.pending.acquire().await;
+        let task = assignment
+            .task
+            .as_ref()
+            .map(|task| task.name.as_str())
+            .unwrap_or("<unspecified>");
+        info!(job_id = %assignment.job_id, execution_id = %assignment.execution_id,
+            assignment_id = %assignment.assignment_id, task, "runtime acquired execution");
         Ok(Response::new(AcquireExecutionResponse {
-            assignment: Some(self.pending.acquire().await),
+            assignment: Some(assignment),
         }))
     }
 
@@ -181,14 +193,59 @@ impl RuntimeService for WorkerRuntimeService {
         request: Request<ReportExecutionRequest>,
     ) -> Result<Response<ReportExecutionResponse>, Status> {
         let report = request.into_inner();
-        self.pending.report(report.clone()).await?;
+        let assignment = self.pending.report(report.clone()).await?;
+        let state = ExecutionState::try_from(report.state)
+            .map_err(|_| Status::invalid_argument("unknown execution state"))?;
+        let task = assignment
+            .task
+            .as_ref()
+            .map(|task| task.name.as_str())
+            .unwrap_or("<unspecified>");
+        let failure_code = report
+            .outcome
+            .as_ref()
+            .and_then(|outcome| outcome.failure.as_ref())
+            .map(|failure| failure.code.as_str());
+        let serialization_format = report
+            .outcome
+            .as_ref()
+            .map(|outcome| outcome.serialization_format.as_str());
+        match state {
+            ExecutionState::Running => info!(job_id = %assignment.job_id,
+                execution_id = %report.execution_id, assignment_id = %report.assignment_id,
+                task, "runtime reported execution running"),
+            ExecutionState::Succeeded => info!(job_id = %assignment.job_id,
+                execution_id = %report.execution_id, assignment_id = %report.assignment_id,
+                task, serialization_format, "runtime reported execution succeeded"),
+            ExecutionState::Failed => warn!(job_id = %assignment.job_id,
+                execution_id = %report.execution_id, assignment_id = %report.assignment_id,
+                task, failure_code, "runtime reported execution failed"),
+            _ => unreachable!("pending execution accepted only supported states"),
+        }
 
         // Local lifecycle state advances before Core acknowledgement. This POC intentionally has
         // no retry/outbox reconciliation, so a forwarding failure can leave Core behind the worker.
-        let response = self.core_client.report_execution(report).await?;
+        info!(job_id = %assignment.job_id, execution_id = %report.execution_id,
+            assignment_id = %report.assignment_id, task, state = ?state,
+            "forwarding execution report to core");
+        let response = match self.core_client.report_execution(report).await {
+            Ok(response) => response,
+            Err(status) => {
+                error!(job_id = %assignment.job_id, execution_id = %assignment.execution_id,
+                    assignment_id = %assignment.assignment_id, task, error = %status,
+                    "failed to forward execution report to core");
+                return Err(status);
+            }
+        };
         if !response.accepted {
+            error!(job_id = %assignment.job_id, execution_id = %assignment.execution_id,
+                assignment_id = %assignment.assignment_id, task,
+                "failed to forward execution report to core");
             return Err(Status::internal("Core did not accept execution report"));
         }
+        info!(job_id = %assignment.job_id, execution_id = %assignment.execution_id,
+            assignment_id = %assignment.assignment_id, task,
+            "core accepted execution report");
         Ok(Response::new(ReportExecutionResponse { accepted: true }))
     }
 

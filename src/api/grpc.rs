@@ -1,12 +1,13 @@
 use std::collections::HashMap;
 use std::io::{self, Write};
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime};
 
 use prost::Message;
 use tokio::net::TcpListener;
-use tokio_stream::wrappers::TcpListenerStream;
+use tokio_stream::{Stream, wrappers::TcpListenerStream};
 use tonic::{Request, Response, Status};
 use tracing::{debug, info};
 use uuid::Uuid;
@@ -26,10 +27,9 @@ use crate::protocols::execution::v1::{
 };
 use crate::protocols::runtime::v1::runtime_service_server::{RuntimeService, RuntimeServiceServer};
 use crate::protocols::runtime::v1::{
-    AcquireExecutionRequest, AcquireExecutionResponse, AssignExecutionRequest,
-    AssignExecutionResponse, RegisterRuntimeRequest, RegisterRuntimeResponse,
-    RegisterWorkerRequest, RegisterWorkerResponse, ReportExecutionRequest, ReportExecutionResponse,
-    ReportHeartbeatRequest, ReportHeartbeatResponse,
+    AssignExecutionRequest, AssignExecutionResponse, RegisterRuntimeRequest,
+    RegisterRuntimeResponse, RegisterWorkerRequest, RegisterWorkerResponse, ReportExecutionRequest,
+    ReportExecutionResponse, ReportHeartbeatRequest, ReportHeartbeatResponse,
 };
 use crate::result_backend::{BackendResult, RedisResultBackend, ResultBackendError};
 use crate::scheduler::Scheduler;
@@ -226,12 +226,16 @@ impl CoreExecutionService {
 
 #[tonic::async_trait]
 impl RuntimeService for CoreExecutionService {
-    async fn acquire_execution(
+    type RuntimeSessionStream = Pin<
+        Box<dyn Stream<Item = Result<crate::protocols::runtime::v1::WorkerCommand, Status>> + Send>,
+    >;
+
+    async fn runtime_session(
         &self,
-        _request: Request<AcquireExecutionRequest>,
-    ) -> Result<Response<AcquireExecutionResponse>, Status> {
+        _request: Request<tonic::Streaming<crate::protocols::runtime::v1::RuntimeEvent>>,
+    ) -> Result<Response<Self::RuntimeSessionStream>, Status> {
         Err(Status::unimplemented(
-            "AcquireExecution is obsolete; the scheduler publishes worker assignments",
+            "runtime sessions connect to a Worker",
         ))
     }
 

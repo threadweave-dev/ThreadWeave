@@ -1238,9 +1238,9 @@ dependencies = [
 
 [[package]]
 name = "threadweave-protocols"
-version = "1.2.0"
+version = "1.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "06f6718de3af8e5296dff59c10e004ecb745366567e2b2e1e6cd85f9ebbc9c45"
+checksum = "3c100a9f5831021a80a6c85f7e0161c7edb1405dcc4aac5bf6752aa159ad0beb"
 dependencies = [
  "prost",
  "prost-types",

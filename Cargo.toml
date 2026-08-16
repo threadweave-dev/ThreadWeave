@@ -31,7 +31,7 @@ tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal
 tokio-stream = { version = "0.1", features = ["net"] }
 tonic = "0.14"
 tonic-prost = "0.14"
-threadweave-protocols = { version = "1.2.0"}
+threadweave-protocols = { version = "1.3.0" }
 tracing = "0.1"
 tracing-subscriber = "0.3"
 uuid = { version = "1", features = ["v4"] }

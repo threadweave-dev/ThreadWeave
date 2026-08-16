@@ -4,6 +4,7 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, Notify};
 use tonic::{Request, Response, Status};
 
+use super::CoreWorkerClient;
 use crate::protocols::execution::v1::ExecutionState;
 use crate::protocols::runtime::v1::runtime_service_server::RuntimeService;
 use crate::protocols::runtime::v1::{
@@ -152,11 +153,15 @@ impl PendingExecutions {
 #[derive(Clone)]
 pub struct WorkerRuntimeService {
     pending: PendingExecutions,
+    core_client: Arc<dyn CoreWorkerClient>,
 }
 
 impl WorkerRuntimeService {
-    pub fn new(pending: PendingExecutions) -> Self {
-        Self { pending }
+    pub fn new(pending: PendingExecutions, core_client: Arc<dyn CoreWorkerClient>) -> Self {
+        Self {
+            pending,
+            core_client,
+        }
     }
 }
 
@@ -175,7 +180,15 @@ impl RuntimeService for WorkerRuntimeService {
         &self,
         request: Request<ReportExecutionRequest>,
     ) -> Result<Response<ReportExecutionResponse>, Status> {
-        self.pending.report(request.into_inner()).await?;
+        let report = request.into_inner();
+        self.pending.report(report.clone()).await?;
+
+        // Local lifecycle state advances before Core acknowledgement. This POC intentionally has
+        // no retry/outbox reconciliation, so a forwarding failure can leave Core behind the worker.
+        let response = self.core_client.report_execution(report).await?;
+        if !response.accepted {
+            return Err(Status::internal("Core did not accept execution report"));
+        }
         Ok(Response::new(ReportExecutionResponse { accepted: true }))
     }
 
@@ -214,6 +227,50 @@ mod tests {
     use super::*;
     use crate::protocols::common::v1::Error;
     use crate::protocols::execution::v1::JobResult;
+    use std::sync::Mutex as StdMutex;
+
+    #[derive(Clone, Copy, Default)]
+    enum CoreBehavior {
+        #[default]
+        Accept,
+        Reject,
+        Unavailable,
+    }
+
+    #[derive(Default)]
+    struct RecordingCoreClient {
+        reports: StdMutex<Vec<ReportExecutionRequest>>,
+        behavior: CoreBehavior,
+    }
+
+    #[async_trait::async_trait]
+    impl CoreWorkerClient for RecordingCoreClient {
+        async fn register_worker(
+            &self,
+            _: RegisterWorkerRequest,
+        ) -> Result<RegisterWorkerResponse, Status> {
+            Ok(RegisterWorkerResponse::default())
+        }
+
+        async fn report_heartbeat(
+            &self,
+            _: ReportHeartbeatRequest,
+        ) -> Result<ReportHeartbeatResponse, Status> {
+            Ok(ReportHeartbeatResponse::default())
+        }
+
+        async fn report_execution(
+            &self,
+            report: ReportExecutionRequest,
+        ) -> Result<ReportExecutionResponse, Status> {
+            self.reports.lock().unwrap().push(report);
+            match self.behavior {
+                CoreBehavior::Accept => Ok(ReportExecutionResponse { accepted: true }),
+                CoreBehavior::Reject => Ok(ReportExecutionResponse { accepted: false }),
+                CoreBehavior::Unavailable => Err(Status::unavailable("Core unavailable")),
+            }
+        }
+    }
 
     fn assignment() -> AssignExecutionRequest {
         AssignExecutionRequest {
@@ -234,6 +291,161 @@ mod tests {
             state: state.into(),
             ..Default::default()
         }
+    }
+
+    async fn acquired_service(client: Arc<RecordingCoreClient>) -> WorkerRuntimeService {
+        let pending = PendingExecutions::default();
+        pending.enqueue(assignment()).await.unwrap();
+        pending.acquire().await;
+        WorkerRuntimeService::new(pending, client)
+    }
+
+    #[tokio::test]
+    async fn running_report_is_forwarded_exactly_once_without_changes() {
+        let client = Arc::new(RecordingCoreClient::default());
+        let service = acquired_service(client.clone()).await;
+        let mut running = report(ExecutionState::Running, 1);
+        running.observed_at = Some(prost_types::Timestamp {
+            seconds: 123,
+            nanos: 456,
+        });
+
+        let response = service
+            .report_execution(Request::new(running.clone()))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert!(response.accepted);
+        assert_eq!(*client.reports.lock().unwrap(), [running]);
+    }
+
+    #[tokio::test]
+    async fn terminal_outcomes_are_forwarded_without_changes() {
+        let success_client = Arc::new(RecordingCoreClient::default());
+        let success_service = acquired_service(success_client.clone()).await;
+        success_service
+            .report_execution(Request::new(report(ExecutionState::Running, 1)))
+            .await
+            .unwrap();
+        let mut succeeded = report(ExecutionState::Succeeded, 2);
+        succeeded.outcome = Some(JobResult {
+            payload: br#"{"answer":42}"#.to_vec(),
+            serialization_format: "application/json+threadweave".into(),
+            ..Default::default()
+        });
+        success_service
+            .report_execution(Request::new(succeeded.clone()))
+            .await
+            .unwrap();
+        assert_eq!(success_client.reports.lock().unwrap()[1], succeeded);
+
+        let failure_client = Arc::new(RecordingCoreClient::default());
+        let failure_service = acquired_service(failure_client.clone()).await;
+        failure_service
+            .report_execution(Request::new(report(ExecutionState::Running, 1)))
+            .await
+            .unwrap();
+        let mut failed = report(ExecutionState::Failed, 2);
+        failed.outcome = Some(JobResult {
+            serialization_format: "json".into(),
+            failure: Some(Error {
+                code: "USER_ERROR".into(),
+                message: "boom".into(),
+                metadata: None,
+            }),
+            ..Default::default()
+        });
+        failure_service
+            .report_execution(Request::new(failed.clone()))
+            .await
+            .unwrap();
+        assert_eq!(failure_client.reports.lock().unwrap()[1], failed);
+    }
+
+    #[tokio::test]
+    async fn invalid_lifecycle_and_stale_reports_are_not_forwarded() {
+        let client = Arc::new(RecordingCoreClient::default());
+        let service = acquired_service(client.clone()).await;
+
+        let invalid = service
+            .report_execution(Request::new(report(ExecutionState::Succeeded, 1)))
+            .await
+            .unwrap_err();
+        assert_eq!(invalid.code(), tonic::Code::FailedPrecondition);
+        assert!(client.reports.lock().unwrap().is_empty());
+
+        service
+            .report_execution(Request::new(report(ExecutionState::Running, 2)))
+            .await
+            .unwrap();
+        let stale = service
+            .report_execution(Request::new(report(ExecutionState::Running, 2)))
+            .await
+            .unwrap_err();
+        assert_eq!(stale.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(client.reports.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn core_rejection_and_unavailability_are_returned_to_runtime() {
+        let rejecting = Arc::new(RecordingCoreClient {
+            behavior: CoreBehavior::Reject,
+            ..Default::default()
+        });
+        let rejected = acquired_service(rejecting)
+            .await
+            .report_execution(Request::new(report(ExecutionState::Running, 1)))
+            .await
+            .unwrap_err();
+        assert_eq!(rejected.code(), tonic::Code::Internal);
+
+        let unavailable = Arc::new(RecordingCoreClient {
+            behavior: CoreBehavior::Unavailable,
+            ..Default::default()
+        });
+        let unavailable = acquired_service(unavailable)
+            .await
+            .report_execution(Request::new(report(ExecutionState::Running, 1)))
+            .await
+            .unwrap_err();
+        assert_eq!(unavailable.code(), tonic::Code::Unavailable);
+    }
+
+    #[tokio::test]
+    async fn enqueue_acquire_running_and_succeeded_reach_core_mock() {
+        let client = Arc::new(RecordingCoreClient::default());
+        let pending = PendingExecutions::default();
+        pending.enqueue(assignment()).await.unwrap();
+        let service = WorkerRuntimeService::new(pending, client.clone());
+        let acquired = service
+            .acquire_execution(Request::new(AcquireExecutionRequest::default()))
+            .await
+            .unwrap()
+            .into_inner()
+            .assignment
+            .unwrap();
+        assert_eq!(acquired, assignment());
+
+        service
+            .report_execution(Request::new(report(ExecutionState::Running, 1)))
+            .await
+            .unwrap();
+        let mut succeeded = report(ExecutionState::Succeeded, 2);
+        succeeded.outcome = Some(JobResult {
+            payload: b"result".to_vec(),
+            serialization_format: "bytes".into(),
+            ..Default::default()
+        });
+        service
+            .report_execution(Request::new(succeeded.clone()))
+            .await
+            .unwrap();
+
+        let forwarded = client.reports.lock().unwrap();
+        assert_eq!(forwarded.len(), 2);
+        assert_eq!(forwarded[0].state, i32::from(ExecutionState::Running));
+        assert_eq!(forwarded[1], succeeded);
     }
 
     #[tokio::test]

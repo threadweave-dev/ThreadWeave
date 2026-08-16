@@ -26,8 +26,9 @@ use crate::protocols::runtime::v1::runtime_service_client::RuntimeServiceClient;
 #[cfg(not(test))]
 use crate::protocols::runtime::v1::runtime_service_server::RuntimeServiceServer;
 use crate::protocols::runtime::v1::{
-    AssignExecutionRequest, RegisterWorkerRequest, RegisterWorkerResponse, ReportHeartbeatRequest,
-    ReportHeartbeatResponse, RuntimeHeartbeat, RuntimeStatus, WorkerRegistration,
+    AssignExecutionRequest, RegisterWorkerRequest, RegisterWorkerResponse, ReportExecutionRequest,
+    ReportExecutionResponse, ReportHeartbeatRequest, ReportHeartbeatResponse, RuntimeHeartbeat,
+    RuntimeStatus, WorkerRegistration,
 };
 use crate::worker_registry::worker_incarnation_id;
 
@@ -59,50 +60,72 @@ impl From<BrokerError> for WorkerError {
 }
 
 #[async_trait]
-pub trait WorkerRegistrationClient: Send + Sync {
+pub trait CoreWorkerClient: Send + Sync {
     async fn register_worker(
         &self,
         request: RegisterWorkerRequest,
-    ) -> Result<RegisterWorkerResponse, WorkerError>;
+    ) -> Result<RegisterWorkerResponse, tonic::Status>;
 
     async fn report_heartbeat(
         &self,
         request: ReportHeartbeatRequest,
-    ) -> Result<ReportHeartbeatResponse, WorkerError>;
+    ) -> Result<ReportHeartbeatResponse, tonic::Status>;
+
+    async fn report_execution(
+        &self,
+        request: ReportExecutionRequest,
+    ) -> Result<ReportExecutionResponse, tonic::Status>;
 }
 
-struct GrpcWorkerRegistrationClient {
+struct GrpcCoreWorkerClient {
     endpoint: String,
 }
 
 #[async_trait]
-impl WorkerRegistrationClient for GrpcWorkerRegistrationClient {
+impl CoreWorkerClient for GrpcCoreWorkerClient {
     async fn register_worker(
         &self,
         request: RegisterWorkerRequest,
-    ) -> Result<RegisterWorkerResponse, WorkerError> {
+    ) -> Result<RegisterWorkerResponse, tonic::Status> {
         let mut client = RuntimeServiceClient::connect(self.endpoint.clone())
             .await
-            .map_err(|error| WorkerError(format!("cannot connect to Core: {error}")))?;
+            .map_err(|error| {
+                tonic::Status::unavailable(format!("cannot connect to Core: {error}"))
+            })?;
         client
             .register_worker(request)
             .await
             .map(|response| response.into_inner())
-            .map_err(|error| WorkerError(format!("Core rejected registration: {error}")))
     }
 
     async fn report_heartbeat(
         &self,
         request: ReportHeartbeatRequest,
-    ) -> Result<ReportHeartbeatResponse, WorkerError> {
+    ) -> Result<ReportHeartbeatResponse, tonic::Status> {
         let mut client = RuntimeServiceClient::connect(self.endpoint.clone())
             .await
-            .map_err(|error| WorkerError(format!("cannot connect to Core: {error}")))?;
+            .map_err(|error| {
+                tonic::Status::unavailable(format!("cannot connect to Core: {error}"))
+            })?;
         client
             .report_heartbeat(request)
             .await
             .map(|response| response.into_inner())
-            .map_err(|error| WorkerError(format!("Core rejected heartbeat: {error}")))
+    }
+
+    async fn report_execution(
+        &self,
+        request: ReportExecutionRequest,
+    ) -> Result<ReportExecutionResponse, tonic::Status> {
+        let mut client = RuntimeServiceClient::connect(self.endpoint.clone())
+            .await
+            .map_err(|error| {
+                tonic::Status::unavailable(format!("cannot connect to Core: {error}"))
+            })?;
+        client
+            .report_execution(request)
+            .await
+            .map(|response| response.into_inner())
     }
 }
 
@@ -163,7 +186,7 @@ pub struct Worker {
     destination: String,
     identity: WorkerIdentity,
     advertised_capacity: AdvertisedCapacity,
-    registration_client: Arc<dyn WorkerRegistrationClient>,
+    core_client: Arc<dyn CoreWorkerClient>,
     heartbeat_interval: Duration,
     runtime_address: String,
     pending_executions: PendingExecutions,
@@ -171,7 +194,7 @@ pub struct Worker {
 
 impl Worker {
     pub fn new(broker: Arc<dyn Broker>, config: WorkerConfig) -> Self {
-        let registration_client = Arc::new(GrpcWorkerRegistrationClient {
+        let core_client = Arc::new(GrpcCoreWorkerClient {
             endpoint: config.core_endpoint.clone(),
         });
         let identity = WorkerIdentity::new(config.name);
@@ -186,17 +209,17 @@ impl Worker {
                 },
                 capabilities: config.capabilities,
             },
-            registration_client,
+            core_client,
             heartbeat_interval: HEARTBEAT_INTERVAL,
             runtime_address: config.runtime_address,
             pending_executions: PendingExecutions::default(),
         }
     }
 
-    pub fn with_registration_client(
+    pub fn with_core_client(
         broker: Arc<dyn Broker>,
         config: WorkerConfig,
-        registration_client: Arc<dyn WorkerRegistrationClient>,
+        core_client: Arc<dyn CoreWorkerClient>,
     ) -> Self {
         let identity = WorkerIdentity::new(config.name);
         Self {
@@ -210,7 +233,7 @@ impl Worker {
                 },
                 capabilities: config.capabilities,
             },
-            registration_client,
+            core_client,
             heartbeat_interval: HEARTBEAT_INTERVAL,
             runtime_address: config.runtime_address,
             pending_executions: PendingExecutions::default(),
@@ -261,7 +284,7 @@ impl Worker {
         F: Future<Output = ()>,
     {
         let response = self
-            .registration_client
+            .core_client
             .register_worker(RegisterWorkerRequest {
                 registration: Some(self.registration()),
             })
@@ -271,11 +294,11 @@ impl Worker {
             Ok(_) => {
                 let failure = WorkerError("Core did not accept worker registration".to_owned());
                 error!(error = %failure, "worker registration failed");
-                return Err(failure);
+                return Err(WorkerError(failure.to_string()));
             }
             Err(failure) => {
                 error!(error = %failure, "worker registration failed");
-                return Err(failure);
+                return Err(WorkerError(failure.to_string()));
             }
         };
         info!(
@@ -305,6 +328,7 @@ impl Worker {
             Server::builder()
                 .add_service(RuntimeServiceServer::new(WorkerRuntimeService::new(
                     self.pending_executions.clone(),
+                    self.core_client.clone(),
                 )))
                 .serve_with_incoming(TcpListenerStream::new(listener))
                 .await
@@ -344,7 +368,7 @@ impl Worker {
             interval.tick().await;
             sequence_number += 1;
             let response = self
-                .registration_client
+                .core_client
                 .report_heartbeat(ReportHeartbeatRequest {
                     heartbeat: Some(RuntimeHeartbeat {
                         runtime_id: runtime_id.clone(),
@@ -569,26 +593,33 @@ mod tests {
     struct RejectingRegistrationClient;
 
     #[async_trait]
-    impl WorkerRegistrationClient for RejectingRegistrationClient {
+    impl CoreWorkerClient for RejectingRegistrationClient {
         async fn register_worker(
             &self,
             _: RegisterWorkerRequest,
-        ) -> Result<RegisterWorkerResponse, WorkerError> {
-            Err(WorkerError("registration unavailable".to_owned()))
+        ) -> Result<RegisterWorkerResponse, tonic::Status> {
+            Err(tonic::Status::unavailable("registration unavailable"))
         }
 
         async fn report_heartbeat(
             &self,
             _: ReportHeartbeatRequest,
-        ) -> Result<ReportHeartbeatResponse, WorkerError> {
+        ) -> Result<ReportHeartbeatResponse, tonic::Status> {
             panic!("heartbeat must not be sent before registration succeeds")
+        }
+
+        async fn report_execution(
+            &self,
+            _: ReportExecutionRequest,
+        ) -> Result<ReportExecutionResponse, tonic::Status> {
+            panic!("execution report must not be sent before registration succeeds")
         }
     }
 
     #[tokio::test]
     async fn failed_registration_prevents_assignment_consumption() {
         let broker = Arc::new(TestBroker(Mutex::new(Some(BrokerEnvelope::default()))));
-        let worker = Worker::with_registration_client(
+        let worker = Worker::with_core_client(
             broker.clone(),
             WorkerConfig::default(),
             Arc::new(RejectingRegistrationClient),
@@ -619,11 +650,11 @@ mod tests {
     }
 
     #[async_trait]
-    impl WorkerRegistrationClient for AcceptingRegistrationClient {
+    impl CoreWorkerClient for AcceptingRegistrationClient {
         async fn register_worker(
             &self,
             _: RegisterWorkerRequest,
-        ) -> Result<RegisterWorkerResponse, WorkerError> {
+        ) -> Result<RegisterWorkerResponse, tonic::Status> {
             Ok(RegisterWorkerResponse {
                 accepted: true,
                 lease_id: None,
@@ -633,19 +664,26 @@ mod tests {
         async fn report_heartbeat(
             &self,
             request: ReportHeartbeatRequest,
-        ) -> Result<ReportHeartbeatResponse, WorkerError> {
+        ) -> Result<ReportHeartbeatResponse, tonic::Status> {
             let heartbeat = request.heartbeat.unwrap();
             assert!(heartbeat.sequence_number > 0);
             self.heartbeats
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(ReportHeartbeatResponse { accepted: true })
         }
+
+        async fn report_execution(
+            &self,
+            _: ReportExecutionRequest,
+        ) -> Result<ReportExecutionResponse, tonic::Status> {
+            Ok(ReportExecutionResponse { accepted: true })
+        }
     }
 
     #[tokio::test]
     async fn worker_sends_heartbeats_after_successful_registration() {
         let client = Arc::new(AcceptingRegistrationClient::default());
-        let mut worker = Worker::with_registration_client(
+        let mut worker = Worker::with_core_client(
             Arc::new(PendingBroker),
             WorkerConfig::default(),
             client.clone(),
